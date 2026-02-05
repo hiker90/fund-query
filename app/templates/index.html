@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>数据查询</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        .loading.show {
+            display: block;
+        }
+        .spinner-border {
+            width: 2rem;
+            height: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light bg-light">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#">数据查询</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link active" aria-current="page" href="#search" onclick="switchTab('search'); return false;">搜索</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#collection" onclick="switchTab('collection'); return false;">收藏</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#chart" onclick="switchTab('chart'); return false;">图表</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="#valuation" onclick="switchTab('valuation'); return false;">估值</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <section id="search" class="mb-6">
+            <h2>搜索</h2>
+            <div class="input-group mb-3">
+                <input type="text" id="search-input" class="form-control" placeholder="输入代码或名称" aria-label="搜索">
+                <button id="search-btn" class="btn btn-primary" type="button">搜索</button>
+            </div>
+            <div id="search-loading" class="loading">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+                <p class="mt-2">加载中...</p>
+            </div>
+            <div id="search-results" class="mt-3"></div>
+        </section>
+
+        <section id="collection" class="mb-6" style="display: none;">
+            <h2>收藏</h2>
+            <div id="collection-list" class="mt-3"></div>
+        </section>
+
+        <section id="chart" class="mb-6" style="display: none;">
+            <h2>历史走势</h2>
+            <div class="input-group mb-3">
+                <input type="text" id="chart-fund-code" class="form-control" placeholder="输入代码" aria-label="代码">
+                <button id="chart-btn" class="btn btn-primary" type="button">查看图表</button>
+            </div>
+            <div id="chart-loading" class="loading">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+                <p class="mt-2">加载中...</p>
+            </div>
+            <div id="fund-chart" style="width: 100%; height: 400px;"></div>
+        </section>
+
+        <section id="valuation" class="mb-6" style="display: none;">
+            <h2>估值</h2>
+            <div class="input-group mb-3">
+                <input type="text" id="valuation-fund-code" class="form-control" placeholder="输入代码" aria-label="代码">
+                <button id="valuation-btn" class="btn btn-primary" type="button">查看估值</button>
+            </div>
+            <div id="valuation-loading" class="loading">
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+                <p class="mt-2">加载中...</p>
+            </div>
+            <div id="valuation-result" class="mt-3"></div>
+        </section>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function showLoading(elementId) {
+            document.getElementById(elementId).classList.add('show');
+        }
+
+        function hideLoading(elementId) {
+            document.getElementById(elementId).classList.remove('show');
+        }
+
+        function getCollections() {
+            return JSON.parse(localStorage.getItem('fundCollections') || '[]');
+        }
+
+        function addCollection(fund) {
+            const collections = getCollections();
+            if (!collections.some(item => item.code === fund.code)) {
+                collections.push(fund);
+                localStorage.setItem('fundCollections', JSON.stringify(collections));
+                renderCollections();
+            }
+        }
+
+        function removeCollection(code) {
+            const collections = getCollections();
+            const filtered = collections.filter(item => item.code !== code);
+            localStorage.setItem('fundCollections', JSON.stringify(filtered));
+            renderCollections();
+        }
+
+        function addCollectionByCode(code, name, netWorth, dayGrowth) {
+            const fund = {
+                code: code,
+                name: name,
+                netWorth: netWorth,
+                dayGrowth: dayGrowth,
+                monthGrowth: 0,
+                yearGrowth: 0,
+                navDate: new Date().toISOString().split('T')[0]
+            };
+            addCollection(fund);
+        }
+
+        function renderCollections() {
+            const collections = getCollections();
+            const list = document.getElementById('collection-list');
+            
+            if (collections.length === 0) {
+                list.innerHTML = '<p>暂无收藏的</p>';
+                return;
+            }
+
+            let html = '<div class="row">';
+            collections.forEach(fund => {
+                html += `
+                    <div class="col-md-4 mb-3">
+                        <div class="card">
+                            <div class="card-body">
+                                <h5 class="card-title">${fund.name}</h5>
+                                <p class="card-text">代码: ${fund.code}</p>
+                                <p class="card-text">净值: ${fund.netWorth.toFixed(4)}</p>
+                                <p class="card-text">日涨跌幅: ${(fund.dayGrowth * 100).toFixed(2)}%</p>
+                                <button class="btn btn-danger btn-sm" onclick="removeCollection('${fund.code}')">取消收藏</button>
+                                <button class="btn btn-primary btn-sm ms-2" onclick="showFundChartWithTab('${fund.code}')">查看图表</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            list.innerHTML = html;
+        }
+
+        async function searchFunds() {
+            const keyword = document.getElementById('search-input').value;
+            if (!keyword) return;
+
+            showLoading('search-loading');
+            document.getElementById('search-results').innerHTML = '';
+
+            try {
+                const response = await fetch(`/api/fund/search?keyword=${keyword}`);
+                const funds = await response.json();
+                const results = document.getElementById('search-results');
+
+                if (funds.length === 0) {
+                    results.innerHTML = '<p>未找到匹配的</p>';
+                    return;
+                }
+
+                let html = '<div class="row">';
+                funds.forEach(fund => {
+                    html += `
+                        <div class="col-md-4 mb-3">
+                            <div class="card">
+                                <div class="card-body">
+                                    <h5 class="card-title">${fund.name}</h5>
+                                    <p class="card-text">代码: ${fund.code}</p>
+                                    <p class="card-text">净值: ${fund.netWorth.toFixed(4)}</p>
+                                    <p class="card-text">日涨跌幅: ${(fund.dayGrowth * 100).toFixed(2)}%</p>
+                                    <p class="card-text">月涨跌幅: ${(fund.monthGrowth * 100).toFixed(2)}%</p>
+                                    <p class="card-text">年涨跌幅: ${(fund.yearGrowth * 100).toFixed(2)}%</p>
+                                    <button class="btn btn-success btn-sm" onclick="addCollectionByCode('${fund.code}', '${fund.name.replace(/'/g, "\\'")}', ${fund.netWorth}, ${fund.dayGrowth})">添加收藏</button>
+                                    <button class="btn btn-primary btn-sm ms-2" onclick="showFundChartWithTab('${fund.code}')">查看图表</button>
+                                    <button class="btn btn-info btn-sm ms-2" onclick="showFundValuationWithTab('${fund.code}')">查看估值</button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+                results.innerHTML = html;
+            } catch (error) {
+                console.error('搜索失败:', error);
+                document.getElementById('search-results').innerHTML = '<p>搜索失败，请重试</p>';
+            } finally {
+                hideLoading('search-loading');
+            }
+        }
+
+        async function showFundChart(code) {
+            showLoading('chart-loading');
+            try {
+                const response = await fetch(`/api/fund/history/${code}`);
+                const history = await response.json();
+                
+                if (history.length === 0) {
+                    alert('未找到历史数据');
+                    return;
+                }
+
+                const chart = echarts.init(document.getElementById('fund-chart'));
+                
+                const dates = history.map(item => item.date);
+                const values = history.map(item => item.value);
+
+                const option = {
+                    title: {
+                        text: '净值走势',
+                        left: 'center'
+                    },
+                    tooltip: {
+                        trigger: 'axis'
+                    },
+                    xAxis: {
+                        type: 'category',
+                        data: dates,
+                        axisLabel: {
+                            rotate: 45
+                        }
+                    },
+                    yAxis: {
+                        type: 'value'
+                    },
+                    series: [{
+                        data: values,
+                        type: 'line',
+                        smooth: true
+                    }]
+                };
+
+                chart.setOption(option);
+            } catch (error) {
+                console.error('获取图表数据失败:', error);
+                alert('获取图表数据失败，请重试');
+            } finally {
+                hideLoading('chart-loading');
+            }
+        }
+
+        function showFundChartWithTab(code) {
+            switchTab('chart');
+            document.getElementById('chart-fund-code').value = code;
+            showFundChart(code);
+        }
+
+        function showFundValuationWithTab(code) {
+            switchTab('valuation');
+            document.getElementById('valuation-fund-code').value = code;
+            showFundValuation(code);
+        }
+
+        async function showFundValuation(code) {
+            showLoading('valuation-loading');
+            try {
+                const response = await fetch(`/api/fund/valuation/${code}`);
+                const valuation = await response.json();
+                
+                if (!valuation || valuation.error) {
+                    alert('未找到估值数据');
+                    return;
+                }
+
+                const result = document.getElementById('valuation-result');
+                result.innerHTML = `
+                    <div class="card">
+                        <div class="card-body">
+                            <h5 class="card-title">${valuation.name}</h5>
+                            <p class="card-text">代码: ${valuation.code}</p>
+                            <p class="card-text">市盈率: ${valuation.pe.toFixed(2)}</p>
+                            <p class="card-text">市净率: ${valuation.pb.toFixed(2)}</p>
+                            <p class="card-text">市盈率百分位: ${valuation.pePercentile.toFixed(2)}%</p>
+                            <p class="card-text">市净率百分位: ${valuation.pbPercentile.toFixed(2)}%</p>
+                            <p class="card-text">净资产收益率: ${valuation.roe.toFixed(2)}%</p>
+                        </div>
+                    </div>
+                `;
+            } catch (error) {
+                console.error('获取估值数据失败:', error);
+                alert('获取估值数据失败，请重试');
+            } finally {
+                hideLoading('valuation-loading');
+            }
+        }
+
+        document.getElementById('search-btn').addEventListener('click', searchFunds);
+        
+        document.getElementById('chart-btn').addEventListener('click', () => {
+            const code = document.getElementById('chart-fund-code').value;
+            if (code) {
+                showFundChart(code);
+            }
+        });
+
+        document.getElementById('valuation-btn').addEventListener('click', () => {
+            const code = document.getElementById('valuation-fund-code').value;
+            if (code) {
+                showFundValuation(code);
+            }
+        });
+
+        window.onload = function() {
+            renderCollections();
+            updateNavActive();
+        };
+
+        function updateNavActive() {
+            const sections = ['search', 'collection', 'chart', 'valuation'];
+            let currentSection = '';
+            
+            for (const section of sections) {
+                const element = document.getElementById(section);
+                if (element && element.style.display !== 'none') {
+                    currentSection = section;
+                    break;
+                }
+            }
+            
+            const navLinks = document.querySelectorAll('.nav-link');
+            navLinks.forEach(link => {
+                const href = link.getAttribute('href').substring(1);
+                if (href === currentSection) {
+                    link.classList.add('active');
+                    link.setAttribute('aria-current', 'page');
+                } else {
+                    link.classList.remove('active');
+                    link.removeAttribute('aria-current');
+                }
+            });
+        }
+
+        function switchTab(tabId) {
+            const sections = ['search', 'collection', 'chart', 'valuation'];
+            sections.forEach(section => {
+                const element = document.getElementById(section);
+                if (element) {
+                    element.style.display = 'none';
+                }
+            });
+            
+            const targetSection = document.getElementById(tabId);
+            if (targetSection) {
+                targetSection.style.display = 'block';
+            }
+            
+            updateNavActive();
+        }
+    </script>
+</body>
+</html>
