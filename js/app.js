@@ -29,6 +29,7 @@ function parseRoute() {
   const hash = String(location.hash || '').replace(/^#/, '');
   if (hash.startsWith('/fund/')) return { name: 'detail', id: hash.slice('/fund/'.length) };
   if (hash === '/strategy') return { name: 'strategy' };
+  if (hash === '/allocation') return { name: 'allocation' };
   if (hash === '/data') return { name: 'data' };
   return { name: 'holdings' };
 }
@@ -70,6 +71,9 @@ function render() {
   } else if (route.name === 'strategy') {
     currentFundId = null;
     app.innerHTML = views.strategyPage(state);
+  } else if (route.name === 'allocation') {
+    currentFundId = null;
+    app.innerHTML = views.allocationPage(state, buildMetricsMap());
   } else if (route.name === 'data') {
     currentFundId = null;
     app.innerHTML = views.dataPage(state);
@@ -192,16 +196,56 @@ function handleAddFund(form) {
   const name = String(form.elements.name.value || '').trim() || `基金 ${code}`;
   const enteredNav = num(form.elements.nav.value);
   const navDateInput = form.elements.navDate.value || todayISO();
-  const amount = num(form.elements.amount.value);
-  const buyNav = num(form.elements.buyNav.value) || enteredNav;
   const buyDate = form.elements.buyDate.value || navDateInput;
   const fee = num(form.elements.fee.value);
-  const nav = enteredNav > 0 ? enteredNav : amount > 0 ? buyNav : 0;
-  const navDate = enteredNav > 0 ? navDateInput : buyDate;
+
+  // 确定录入模式
+  const baseMode = String(form.querySelector('[name="baseMode"]:checked')?.value || 'trade');
+
+  let amount = 0;        // 成交金额（= 成本 + 手续费不含费？不，amount 是买入金额即本金投入）
+  let buyNav = 0;        // 成交净值
+  let shares = 0;        // 份额
+  let nav = enteredNav;
+  let navDate = enteredNav > 0 ? navDateInput : '';
+
+  if (baseMode === 'pnl') {
+    // 市值 + 收益率 反推
+    const holdingAmount = num(form.elements.holdingAmount.value);
+    const returnPct = num(form.elements.returnPct.value);
+    const currentNav = enteredNav;
+
+    if (holdingAmount > 0 && currentNav > 0) {
+      // 成本 = 市值 / (1 + 收益率)
+      const cost = holdingAmount / (1 + returnPct / 100);
+      shares = holdingAmount / currentNav;
+      amount = cost; // 历史投入本金
+      buyNav = cost / shares; // 反推的成本净值
+    }
+  } else {
+    // 成交方式（原有）
+    amount = num(form.elements.amount.value);
+    buyNav = num(form.elements.buyNav.value);
+    if (amount > 0 && buyNav > 0) shares = amount / buyNav;
+  }
 
   if (amount > 0 && buyNav <= 0) {
-    toast('请填写底仓成交净值', 'error');
+    toast(baseMode === 'pnl' ? '请填写最新净值以便反推' : '请填写底仓成交净值', 'error');
     return;
+  }
+
+  if (amount <= 0 && baseMode === 'pnl') {
+    // 用户填了市值+收益率但没填净值，上面判断已经会拦截；或市值本身为 0
+    const holdingAmount = num(form.elements.holdingAmount.value);
+    if (holdingAmount > 0) {
+      toast('请先查询或手动填写最新净值', 'error');
+      return;
+    }
+  }
+
+  // 如果没填净值但有底仓，用成交净值兜底
+  if (nav <= 0 && amount > 0 && buyNav > 0) {
+    nav = buyNav;
+    navDate = buyDate;
   }
 
   const fund = {
@@ -211,25 +255,25 @@ function handleAddFund(form) {
     nav,
     navDate: nav > 0 ? navDate : '',
     navUpdatedAt: nav > 0 ? Date.now() : 0,
-    navHistory: nav > 0 ? [{ date: navDate, nav }] : [],
+    navHistory: nav > 0 ? [{ date: navDate || buyDate, nav }] : [],
     strategyOverride: null,
     trades: [],
     tierState: (state.settings.defaultStrategy.addTiers || []).map(() => false),
     logicIntact: true
   };
 
-  if (amount > 0 && buyNav > 0) {
+  if (amount > 0 && buyNav > 0 && shares > 0) {
     fund.trades.push({
       id: store.uid(),
       type: 'BUY',
       date: buyDate,
       nav: buyNav,
       amount,
-      shares: amount / buyNav,
+      shares,
       fee,
       source: 'BASE',
       tierIndex: null,
-      note: '初始底仓',
+      note: baseMode === 'pnl' ? '初始底仓（市值+收益率反推）' : '初始底仓',
       closed: false,
       createdAt: Date.now()
     });
@@ -510,6 +554,23 @@ async function handleImportFile(input) {
   }
 }
 
+async function removeCategory(name) {
+  const catName = String(name || '').trim();
+  if (!catName) return;
+  const ok = await confirmDialog({
+    title: '删除类别',
+    message: `删除「${catName}」类别后，该类基金将变为未分类状态。`,
+    confirmText: '删除'
+  });
+  if (!ok) return;
+  state.categories = state.categories.filter((c) => c.name !== catName);
+  state.funds.forEach((fund) => {
+    if (fund.category === catName) fund.category = '';
+  });
+  commit();
+  toast('类别已删除', 'success');
+}
+
 async function clearAllData() {
   const ok = await confirmDialog({
     title: '清空全部数据',
@@ -651,6 +712,16 @@ document.addEventListener('click', (event) => {
       if (input) input.click();
       break;
     }
+    case 'remove-category':
+      removeCategory(target.dataset.name);
+      break;
+    case 'unassign-category': {
+      const fund = getFund(target.dataset.fund);
+      if (!fund) break;
+      fund.category = '';
+      commit();
+      break;
+    }
     case 'clear-data':
       clearAllData();
       break;
@@ -680,31 +751,115 @@ document.addEventListener('submit', (event) => {
     case 'manual-nav':
       handleManualNav(form);
       break;
+    case 'categories':
+      handleCategories(form);
+      break;
     default:
       break;
   }
 });
 
+function handleCategories(form) {
+  const rows = form.querySelectorAll('.cat-edit-row');
+  const seen = new Set();
+  const newCategories = [];
+  let renameMap = {}; // oldName -> newName
+
+  for (const row of rows) {
+    const name = String(row.querySelector('[name="cat-name"]').value || '').trim();
+    const targetPct = num(row.querySelector('[name="cat-target"]').value);
+    const oldName = String(row.dataset.oldName || '').trim();
+    if (!name) continue;
+    if (seen.has(name)) {
+      toast(`类别名「${name}」重复`, 'error');
+      return;
+    }
+    seen.add(name);
+    newCategories.push({ name, targetPct });
+    if (oldName && oldName !== name) {
+      renameMap[oldName] = name;
+    }
+  }
+
+  // 新增行
+  const newName = String(form.elements.newCatName?.value || '').trim();
+  const newTarget = num(form.elements.newCatTarget?.value);
+  if (newName) {
+    if (seen.has(newName)) {
+      toast(`类别名「${newName}」已存在`, 'error');
+      return;
+    }
+    newCategories.push({ name: newName, targetPct: newTarget });
+  }
+
+  // 应用重命名
+  Object.entries(renameMap).forEach(([oldName, newName]) => {
+    state.funds.forEach((fund) => {
+      if (fund.category === oldName) fund.category = newName;
+    });
+  });
+
+  state.categories = newCategories;
+  commit();
+  toast('类别设置已保存', 'success');
+}
+
 document.addEventListener('input', (event) => {
-  if (!event.target.matches('[data-sim]')) return;
-  if (!currentFundId) return;
-  const fund = getFund(currentFundId);
-  if (!fund) return;
+  // 补仓模拟器预览
+  if (event.target.matches('[data-sim]')) {
+    if (!currentFundId) return;
+    const fund = getFund(currentFundId);
+    if (!fund) return;
 
-  const metrics = metricsFor(fund);
-  const amountInput = document.querySelector('[data-sim="amount"]');
-  const priceInput = document.querySelector('[data-sim="price"]');
-  if (!amountInput || !priceInput) return;
+    const metrics = metricsFor(fund);
+    const amountInput = document.querySelector('[data-sim="amount"]');
+    const priceInput = document.querySelector('[data-sim="price"]');
+    if (!amountInput || !priceInput) return;
 
-  const result = simulateAdd(
-    metrics.position,
-    num(amountInput.value),
-    num(priceInput.value),
-    metrics.strategy
-  );
-  const box = document.getElementById('sim-result');
-  if (box) box.innerHTML = views.simResultHtml(result, metrics.strategy);
+    const result = simulateAdd(
+      metrics.position,
+      num(amountInput.value),
+      num(priceInput.value),
+      metrics.strategy
+    );
+    const box = document.getElementById('sim-result');
+    if (box) box.innerHTML = views.simResultHtml(result, metrics.strategy);
+    return;
+  }
+
+  // 底仓市值+收益率 实时反推预览
+  if (
+    event.target.matches('[name="holdingAmount"], [name="returnPct"], [name="nav"]') &&
+    document.querySelector('form[data-form="add-fund"]')
+  ) {
+    updateBaseDerivePreview();
+  }
 });
+
+function updateBaseDerivePreview() {
+  const form = document.querySelector('form[data-form="add-fund"]');
+  if (!form) return;
+  const hint = document.getElementById('base-derive-hint');
+  if (!hint) return;
+
+  const holdingAmount = num(form.elements.holdingAmount?.value);
+  const returnPct = num(form.elements.returnPct?.value);
+  const currentNav = num(form.elements.nav?.value);
+
+  if (holdingAmount <= 0 || currentNav <= 0) {
+    hint.hidden = true;
+    return;
+  }
+
+  const cost = holdingAmount / (1 + returnPct / 100);
+  const shares = holdingAmount / currentNav;
+  const costNav = cost / shares;
+
+  document.getElementById('derived-cost').textContent = cost.toFixed(2);
+  document.getElementById('derived-shares').textContent = shares.toFixed(2);
+  document.getElementById('derived-nav').textContent = costNav.toFixed(4);
+  hint.hidden = false;
+}
 
 document.addEventListener('change', (event) => {
   const toggle = event.target.closest('[data-action="toggle-logic"]');
@@ -714,6 +869,27 @@ document.addEventListener('change', (event) => {
       fund.logicIntact = Boolean(toggle.checked);
       store.save(state);
       render();
+    }
+    return;
+  }
+
+  // 底仓录入模式切换
+  if (event.target.matches('[name="baseMode"]')) {
+    const panelName = event.target.value;
+    document.querySelectorAll('[data-base-panel]').forEach((panel) => {
+      panel.hidden = panel.dataset.basePanel !== panelName;
+    });
+    if (panelName === 'pnl') updateBaseDerivePreview();
+    return;
+  }
+
+  // 未分类基金 → 分配类别
+  const assignSelect = event.target.closest('[data-action="assign-category"]');
+  if (assignSelect) {
+    const fund = getFund(assignSelect.dataset.fund);
+    if (fund) {
+      fund.category = String(assignSelect.value || '').trim();
+      commit();
     }
     return;
   }

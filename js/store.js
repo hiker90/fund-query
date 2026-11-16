@@ -1,7 +1,7 @@
 import { DEFAULT_STRATEGY, cloneStrategy, normalizeTiers, num } from './strategy.js';
 
 const STORAGE_KEY = 'fundpilot.v1';
-export const VERSION = 1;
+export const VERSION = 2;
 
 export function uid() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -14,6 +14,7 @@ export function defaultState() {
   return {
     version: VERSION,
     settings: { defaultStrategy: cloneStrategy(DEFAULT_STRATEGY) },
+    categories: [],
     funds: []
   };
 }
@@ -69,6 +70,7 @@ function sanitizeFund(fund) {
     navDate: typeof fund.navDate === 'string' ? fund.navDate : '',
     navUpdatedAt: num(fund.navUpdatedAt),
     navHistory,
+    category: typeof fund.category === 'string' ? fund.category.trim() : '',
     strategyOverride,
     trades,
     tierState: Array.isArray(fund.tierState) ? fund.tierState.map(Boolean) : [],
@@ -92,6 +94,13 @@ export function normalizeState(raw) {
     });
     state.settings.defaultStrategy = strategy;
   }
+
+  state.categories = (Array.isArray(raw.categories) ? raw.categories : [])
+    .map((cat) => ({
+      name: typeof cat.name === 'string' ? cat.name.trim() : '',
+      targetPct: num(cat.targetPct)
+    }))
+    .filter((cat) => cat.name);
 
   state.funds = (Array.isArray(raw.funds) ? raw.funds : []).map(sanitizeFund).filter(Boolean);
   return state;

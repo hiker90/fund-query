@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd } from './strategy.js';
+import { simulateAdd, computeAllocation } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -648,10 +648,27 @@ export function addFundSheetBody() {
       </div>
 
       <h3 class="form-section">初始底仓（可跳过）</h3>
-      <div class="field-grid">
-        ${field({ label: '买入金额（元）', name: 'amount', placeholder: '10000' })}
-        ${field({ label: '成交净值', name: 'buyNav', placeholder: '1.0000' })}
+      <div class="segmented" data-toggle="base-mode">
+        <label><input type="radio" name="baseMode" value="trade" checked><span>成交金额 + 净值</span></label>
+        <label><input type="radio" name="baseMode" value="pnl"><span>市值 + 收益率</span></label>
       </div>
+
+      <div data-base-panel="trade">
+        <div class="field-grid">
+          ${field({ label: '买入金额（元）', name: 'amount', placeholder: '10000' })}
+          ${field({ label: '成交净值', name: 'buyNav', placeholder: '1.0000' })}
+        </div>
+      </div>
+      <div data-base-panel="pnl" hidden>
+        <div class="field-grid">
+          ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
+          ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', hint: '正数=盈利，负数=亏损' })}
+        </div>
+        <p class="hint-line" id="base-derive-hint" hidden>
+          反推结果：成本 <b id="derived-cost">—</b> 元 · 份额 <b id="derived-shares">—</b> 份 · 成本净值 <b id="derived-nav">—</b>
+        </p>
+      </div>
+
       <div class="field-grid">
         ${field({ label: '买入日期', name: 'buyDate', value: today, type: 'date', inputmode: 'none' })}
         ${field({ label: '手续费（元）', name: 'fee', placeholder: '0' })}
@@ -746,4 +763,188 @@ export function overrideSheetBody(fund, effective) {
       <button class="btn primary block" type="submit">保存覆盖</button>
       <button class="btn ghost block danger-text" type="button" data-action="clear-override" data-fund="${esc(fund.id)}">恢复跟随全局模板</button>
     </form>`;
+}
+
+function fmtFundName(fund) {
+  return `${fund.name || '—'} · ${fund.code}`;
+}
+
+function deviationClass(deviation) {
+  if (!Number.isFinite(deviation)) return '';
+  const abs = Math.abs(deviation);
+  if (abs < 1) return '';
+  if (abs < 5) return deviation > 0 ? 'mild-over' : 'mild-under';
+  return deviation > 0 ? 'is-over' : 'is-under';
+}
+
+export function allocationPage(state, metricsMap) {
+  const alloc = computeAllocation(state, metricsMap);
+  const targetTotalDeviation = Math.abs(alloc.configuredTargetTotal - 100);
+  const targetTone =
+    alloc.configuredTargetTotal === 0 ? '' : targetTotalDeviation < 2 ? 'badge-ok' : targetTotalDeviation < 10 ? 'badge-accent' : 'badge-danger';
+
+  const hasData = alloc.totalMarketValue > 0;
+  const hasConfig = state.categories.length > 0;
+
+  // 每个类别的可视化行
+  const categoryRows = alloc.categories.length
+    ? alloc.categories
+        .map((cat) => {
+          // 条形图：灰底全宽=100%，目标线一条竖线，实际填充一段
+          const barTargetLeft = cat.targetPct; // 目标线位置 0~100
+          const barActualWidth = Math.min(cat.actualPct, 100);
+          const tone = deviationClass(cat.deviation);
+          const sign = cat.deviation > 0 ? '+' : '';
+          return `
+          <section class="alloc-row${cat.unconfigured ? ' is-unconfigured' : ''} ${tone ? toneClass(cat.deviation) : ''}"
+            data-category="${esc(cat.name)}">
+            <div class="alloc-head">
+              <div class="alloc-head-left">
+                <b>${esc(cat.name)}</b>
+                ${cat.unconfigured ? '<span class="alloc-tag">未设目标</span>' : ''}
+                <span class="muted">${cat.fundCount} 只</span>
+              </div>
+              <div class="alloc-head-right">
+                <span class="num">${fmtMoney(cat.actualValue)}</span>
+                <span class="num ${toneClass(cat.deviation)}">${sign}${fmtPct(cat.deviation)}</span>
+              </div>
+            </div>
+            <div class="alloc-bar-wrap">
+              <div class="alloc-bar-track">
+                <div class="alloc-bar-actual" style="width:${barActualWidth}%"></div>
+                <div class="alloc-bar-target" style="left:${barTargetLeft}%"></div>
+              </div>
+              <div class="alloc-bar-labels">
+                <span>实际 ${fmtPct(cat.actualPct, { signed: false })}</span>
+                <span class="target-label">目标 ${fmtPct(cat.targetPct, { signed: false })}</span>
+              </div>
+            </div>
+            ${
+              cat.funds.length > 0
+                ? `<div class="alloc-funds">
+                    ${cat.funds
+                      .map(
+                        (f) => `
+                    <div class="alloc-fund-item">
+                      <span>${esc(fmtFundName(f.fund))}</span>
+                      <b class="num">${fmtMoney(f.marketValue)}</b>
+                      <button class="link-btn" type="button" data-action="unassign-category" data-fund="${esc(f.fund.id)}">移除</button>
+                    </div>`
+                      )
+                      .join('')}
+                   </div>`
+                : ''
+            }
+          </section>`;
+        })
+        .join('')
+    : '';
+
+  // 未分类基金
+  const uncategorizedBlock =
+    alloc.uncategorizedFunds.length > 0
+      ? `
+      <section class="card">
+        <h2 class="card-title">未分类资产</h2>
+        <p class="card-sub">${fmtPct(alloc.uncategorizedPct, { signed: false })} · ${alloc.uncategorizedFunds.length} 只</p>
+        <div class="uncat-list">
+          ${alloc.uncategorizedFunds
+            .map(
+              (item) => `
+            <div class="uncat-item">
+              <span>${esc(fmtFundName(item.fund))}</span>
+              <b class="num">${fmtMoney(item.marketValue)}</b>
+              <select data-action="assign-category" data-fund="${esc(item.fund.id)}">
+                <option value="">分配到…</option>
+                ${state.categories
+                  .map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`)
+                  .join('')}
+              </select>
+            </div>`
+            )
+            .join('')}
+        </div>
+      </section>`
+      : '';
+
+  // 顶部 hero
+  const heroStatus = !hasData
+    ? '先添加基金并登记底仓，配置页面才会显示占比'
+    : !hasConfig
+      ? '添加分类并设置目标比例，开始跟踪资产配置'
+      : targetTotalDeviation >= 20
+        ? '⚠️ 目标合计远离 100%，建议调整'
+        : '✓ 目标配置正常';
+
+  // 类别编辑表单行
+  const categoryEditorRows = state.categories
+    .map(
+      (cat) => `
+      <div class="cat-edit-row">
+        <input type="text" name="cat-name" value="${esc(cat.name)}" placeholder="类别名"
+          data-old-name="${esc(cat.name)}">
+        <input type="text" name="cat-target" value="${esc(String(cat.targetPct))}"
+          inputmode="decimal" placeholder="目标 %">
+        <button class="icon-btn small" type="button" data-action="remove-category"
+          data-name="${esc(cat.name)}" aria-label="删除该类别">✕</button>
+      </div>`
+    )
+    .join('');
+
+  return `
+    <header class="topbar">
+      <div class="topbar-row">
+        <div>
+          <p class="eyebrow">资产配置</p>
+          <h1>配置</h1>
+        </div>
+      </div>
+    </header>
+    <main class="page">
+      <section class="hero-card">
+        <p class="hero-label">总资产市值</p>
+        <strong class="hero-value num">¥ ${fmtMoney(alloc.totalMarketValue)}</strong>
+        <div class="hero-chips">
+          <div>
+            <span>已配置目标合计</span>
+            <b class="num ${targetTone}">${fmtPct(alloc.configuredTargetTotal, { signed: false })}</b>
+          </div>
+          <div>
+            <span>未分类</span>
+            <b class="num">${fmtPct(alloc.uncategorizedPct, { signed: false })}</b>
+          </div>
+        </div>
+        <p class="hero-note">${esc(heroStatus)}</p>
+      </section>
+
+      ${
+        hasData && !hasConfig
+          ? '<section class="empty-inline"><p>还没有配置分类，先添加一个类别和目标比例。</p></section>'
+          : hasData
+            ? `<section class="card">
+                <h2 class="card-title">类别占比与偏差</h2>
+                <p class="card-sub">灰色竖线=目标位置，彩色填充=实际占比。正偏差=超配，负偏差=低配。</p>
+                <div class="alloc-list">${categoryRows || '<p class="empty-inline">暂无分类资产。</p>'}</div>
+              </section>`
+            : '<p class="empty-inline">登记底仓后才能计算资产配置。</p>'
+      }
+
+      ${uncategorizedBlock}
+
+      <section class="card">
+        <h2 class="card-title">类别管理</h2>
+        <p class="card-sub">添加、重命名、删除分类并设定目标比例。目标合计不必恰好 100%。</p>
+        <form class="form" data-form="categories">
+          <div class="cat-edit-list">${categoryEditorRows || '<p class="empty-inline">还没有类别，加一个吧。</p>'}</div>
+          <div class="cat-edit-add">
+            <input type="text" name="newCatName" placeholder="类别名，如 指数型 / 行业主题 / 债券" autocomplete="off">
+            <input type="text" name="newCatTarget" placeholder="目标 %" inputmode="decimal" autocomplete="off">
+            <button class="btn ghost small" type="submit">＋ 添加</button>
+          </div>
+          <button class="btn primary block" type="submit">保存类别设置</button>
+        </form>
+      </section>
+
+      <p class="footnote">占比按当前市值计算；无持仓的基金不计入配置分母。</p>
+    </main>`;
 }

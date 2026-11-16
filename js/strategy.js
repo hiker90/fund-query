@@ -318,3 +318,90 @@ export function validateStrategy(draft) {
   }
   return errors;
 }
+
+/**
+ * 计算资产配置分析。
+ * 口径：统一用 marketValue = shares * currentNav 做占比，无持仓（shares=0）不计入分母。
+ * 返回各分类别的实际占比、目标占比、偏差，以及未分类基金。
+ */
+export function computeAllocation(state, metricsMap) {
+  const categories = state.categories || [];
+  const funds = state.funds || [];
+
+  // 按类别聚合市值
+  const byCategory = new Map();
+  let totalMarketValue = 0;
+  const uncategorizedFunds = [];
+
+  for (const fund of funds) {
+    const metrics = metricsMap.get(fund.id);
+    if (!metrics) continue;
+    const mv = metrics.marketValue;
+    // 只有有持仓的才计入
+    if (metrics.position.shares <= EPS || mv <= EPS) continue;
+    totalMarketValue += mv;
+
+    const cat = (fund.category || '').trim();
+    if (!cat) {
+      uncategorizedFunds.push({ fund, marketValue: mv });
+    } else {
+      const entry = byCategory.get(cat) || { name: cat, marketValue: 0, fundCount: 0, funds: [] };
+      entry.marketValue += mv;
+      entry.fundCount += 1;
+      entry.funds.push({ fund, marketValue: mv });
+      byCategory.set(cat, entry);
+    }
+  }
+
+  // 合并用户配置的 categories 和实际出现的 category
+  const result = categories.map((config) => {
+    const actual = byCategory.get(config.name);
+    const actualValue = actual ? actual.marketValue : 0;
+    const actualPct = totalMarketValue > EPS ? (actualValue / totalMarketValue) * 100 : 0;
+    const targetPct = num(config.targetPct);
+    const deviation = actualPct - targetPct; // 正=超配，负=低配
+    return {
+      name: config.name,
+      targetPct,
+      actualValue,
+      actualPct,
+      deviation,
+      fundCount: actual ? actual.fundCount : 0,
+      funds: actual ? actual.funds : []
+    };
+  });
+
+  // 把有实际市值但没配置目标的 category 也列出来（targetPct=0）
+  const configuredNames = new Set(categories.map((c) => c.name));
+  for (const [name, actual] of byCategory) {
+    if (!configuredNames.has(name)) {
+      const actualPct = totalMarketValue > EPS ? (actual.marketValue / totalMarketValue) * 100 : 0;
+      result.push({
+        name,
+        targetPct: 0,
+        actualValue: actual.marketValue,
+        actualPct,
+        deviation: actualPct,
+        fundCount: actual.fundCount,
+        funds: actual.funds,
+        unconfigured: true
+      });
+    }
+  }
+
+  // 按 |偏差| 降序排列，偏离最大的放前面
+  result.sort((a, b) => Math.abs(b.deviation) - Math.abs(a.deviation));
+
+  const uncategorizedValue = uncategorizedFunds.reduce((sum, item) => sum + item.marketValue, 0);
+  const uncategorizedPct = totalMarketValue > EPS ? (uncategorizedValue / totalMarketValue) * 100 : 0;
+  const configuredTargetTotal = categories.reduce((sum, c) => sum + num(c.targetPct), 0);
+
+  return {
+    totalMarketValue,
+    configuredTargetTotal,
+    categories: result,
+    uncategorizedFunds,
+    uncategorizedValue,
+    uncategorizedPct
+  };
+}
