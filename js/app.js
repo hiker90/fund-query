@@ -1,0 +1,742 @@
+import * as store from './store.js';
+import {
+  computeFundMetrics,
+  mergeStrategy,
+  normalizeTiers,
+  num,
+  simulateAdd,
+  validateStrategy
+} from './strategy.js';
+import { fetchQuotes, isFundCode } from './quote.js';
+import * as views from './views.js';
+import {
+  confirmDialog,
+  downloadText,
+  hideSheet,
+  showSheet,
+  toast,
+  todayISO
+} from './ui.js';
+
+let state = store.load();
+let refreshing = false;
+let currentFundId = null;
+let lastRouteKey = '';
+
+const app = document.getElementById('app');
+
+function parseRoute() {
+  const hash = String(location.hash || '').replace(/^#/, '');
+  if (hash.startsWith('/fund/')) return { name: 'detail', id: hash.slice('/fund/'.length) };
+  if (hash === '/strategy') return { name: 'strategy' };
+  if (hash === '/data') return { name: 'data' };
+  return { name: 'holdings' };
+}
+
+function getFund(id) {
+  return state.funds.find((fund) => fund.id === id) || null;
+}
+
+function metricsFor(fund) {
+  return computeFundMetrics(fund, state.settings.defaultStrategy);
+}
+
+function buildMetricsMap() {
+  return new Map(state.funds.map((fund) => [fund.id, metricsFor(fund)]));
+}
+
+function updateTabs(route) {
+  document.querySelectorAll('.tabbar a').forEach((link) => {
+    const tab = link.dataset.tab;
+    const active =
+      tab === route.name || (tab === 'holdings' && route.name === 'detail');
+    link.classList.toggle('is-active', active);
+    if (active) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  });
+}
+
+function render() {
+  const route = parseRoute();
+
+  if (route.name === 'detail') {
+    const fund = getFund(route.id);
+    if (!fund) {
+      location.hash = '#/holdings';
+      return;
+    }
+    currentFundId = fund.id;
+    app.innerHTML = views.detailPage(metricsFor(fund));
+  } else if (route.name === 'strategy') {
+    currentFundId = null;
+    app.innerHTML = views.strategyPage(state);
+  } else if (route.name === 'data') {
+    currentFundId = null;
+    app.innerHTML = views.dataPage(state);
+  } else {
+    currentFundId = null;
+    app.innerHTML = views.holdingsPage(state, buildMetricsMap(), { refreshing });
+  }
+
+  updateTabs(route);
+
+  const routeKey = route.name === 'detail' ? `detail:${route.id}` : route.name;
+  if (routeKey !== lastRouteKey) {
+    lastRouteKey = routeKey;
+    window.scrollTo(0, 0);
+  }
+}
+
+function commit() {
+  store.save(state);
+  render();
+}
+
+function normalizeTierState(fund) {
+  const tiers = (state.settings.defaultStrategy.addTiers || []).length;
+  const current = Array.isArray(fund.tierState) ? fund.tierState : [];
+  fund.tierState = Array.from({ length: tiers }, (_, index) => Boolean(current[index]));
+}
+
+function applyQuote(fund, quote) {
+  if (quote.name) fund.name = quote.name;
+  if (!(quote.nav > 0)) return;
+  fund.nav = quote.nav;
+  fund.navDate = quote.navDate || fund.navDate;
+  fund.navUpdatedAt = Date.now();
+
+  const history = Array.isArray(fund.navHistory) ? fund.navHistory : [];
+  const existing = history.findIndex((item) => item.date === fund.navDate);
+  if (existing >= 0) history[existing] = { date: fund.navDate, nav: quote.nav };
+  else history.push({ date: fund.navDate, nav: quote.nav });
+  history.sort((a, b) => a.date.localeCompare(b.date));
+  fund.navHistory = history.slice(-365);
+}
+
+async function refreshFunds(ids = null) {
+  if (refreshing) return;
+  const funds = state.funds.filter((fund) => !ids || ids.includes(fund.id));
+  if (funds.length === 0) {
+    toast('请先添加需要监控的基金', 'warn');
+    return;
+  }
+
+  refreshing = true;
+  render();
+
+  try {
+    const quotes = await fetchQuotes(funds.map((fund) => fund.code));
+    const missing = [];
+    let updated = 0;
+
+    funds.forEach((fund) => {
+      const quote = quotes.get(fund.code);
+      if (!quote || !(quote.nav > 0)) {
+        missing.push(fund.code);
+        return;
+      }
+      applyQuote(fund, quote);
+      updated += 1;
+    });
+
+    store.save(state);
+    if (updated > 0) toast(`已更新 ${updated} 只基金的净值`, 'success');
+    if (missing.length > 0) toast(`未取到 ${missing.join('、')} 的净值，可手动录入`, 'warn');
+  } catch (error) {
+    toast(`刷新失败：${error.message}`, 'error');
+  } finally {
+    refreshing = false;
+    render();
+  }
+}
+
+function openAddFund() {
+  showSheet({
+    title: '添加监控基金',
+    subtitle: '输入 6 位代码，可自动查询名称与净值',
+    body: views.addFundSheetBody(),
+    tall: true
+  });
+}
+
+function openTrade(fundId, preset = {}) {
+  const fund = getFund(fundId);
+  if (!fund) return;
+  showSheet({
+    title: preset.type === 'SELL' ? '登记卖出' : '登记买入',
+    subtitle: `${fund.name || fund.code} · 补仓后规则线会自动重算`,
+    body: views.tradeSheetBody(fund, metricsFor(fund), preset),
+    tall: true
+  });
+}
+
+function readTiers(container) {
+  if (!container) return [];
+  return [...container.querySelectorAll('.tier-row')].map((row) => ({
+    dropPct: num(row.querySelector('[name="tierDrop"]').value),
+    amount: num(row.querySelector('[name="tierAmount"]').value)
+  }));
+}
+
+function handleAddFund(form) {
+  const code = String(form.elements.code.value || '').trim();
+  if (!isFundCode(code)) {
+    toast('请输入 6 位基金代码', 'error');
+    return;
+  }
+  if (state.funds.some((fund) => fund.code === code)) {
+    toast('该基金已在监控列表中', 'warn');
+    return;
+  }
+
+  const name = String(form.elements.name.value || '').trim() || `基金 ${code}`;
+  const enteredNav = num(form.elements.nav.value);
+  const navDateInput = form.elements.navDate.value || todayISO();
+  const amount = num(form.elements.amount.value);
+  const buyNav = num(form.elements.buyNav.value) || enteredNav;
+  const buyDate = form.elements.buyDate.value || navDateInput;
+  const fee = num(form.elements.fee.value);
+  const nav = enteredNav > 0 ? enteredNav : amount > 0 ? buyNav : 0;
+  const navDate = enteredNav > 0 ? navDateInput : buyDate;
+
+  if (amount > 0 && buyNav <= 0) {
+    toast('请填写底仓成交净值', 'error');
+    return;
+  }
+
+  const fund = {
+    id: store.uid(),
+    code,
+    name,
+    nav,
+    navDate: nav > 0 ? navDate : '',
+    navUpdatedAt: nav > 0 ? Date.now() : 0,
+    navHistory: nav > 0 ? [{ date: navDate, nav }] : [],
+    strategyOverride: null,
+    trades: [],
+    tierState: (state.settings.defaultStrategy.addTiers || []).map(() => false),
+    logicIntact: true
+  };
+
+  if (amount > 0 && buyNav > 0) {
+    fund.trades.push({
+      id: store.uid(),
+      type: 'BUY',
+      date: buyDate,
+      nav: buyNav,
+      amount,
+      shares: amount / buyNav,
+      fee,
+      source: 'BASE',
+      tierIndex: null,
+      note: '初始底仓',
+      closed: false,
+      createdAt: Date.now()
+    });
+  }
+
+  state.funds.push(fund);
+  store.save(state);
+  hideSheet();
+  render();
+  toast('已加入监控', 'success');
+  if (parseRoute().name !== 'holdings') location.hash = '#/holdings';
+}
+
+function handleStrategy(form) {
+  const draft = {
+    stopLossPct: num(form.elements.stopLossPct.value),
+    takeProfitPct: num(form.elements.takeProfitPct.value),
+    takeProfitSellRatio: num(form.elements.takeProfitSellRatio.value),
+    trailingStopPct: num(form.elements.trailingStopPct.value),
+    reserveAmount: num(form.elements.reserveAmount.value),
+    reserveTriggerPct: num(form.elements.reserveTriggerPct.value),
+    addPositionSellPct: num(form.elements.addPositionSellPct.value),
+    addTiers: readTiers(form.querySelector('#strategy-tiers'))
+  };
+
+  const errors = validateStrategy(draft);
+  if (errors.length > 0) {
+    toast(errors[0], 'error');
+    return;
+  }
+
+  state.settings.defaultStrategy = { ...draft, addTiers: normalizeTiers(draft.addTiers) };
+  state.funds.forEach(normalizeTierState);
+  commit();
+  toast('策略模板已保存', 'success');
+}
+
+function handleOverride(form) {
+  const fund = getFund(form.dataset.fund);
+  if (!fund) return;
+
+  const override = {};
+  ['stopLossPct', 'takeProfitPct', 'takeProfitSellRatio', 'trailingStopPct', 'addPositionSellPct', 'reserveAmount'].forEach(
+    (key) => {
+      const raw = String(form.elements[key].value || '').trim();
+      if (raw !== '' && Number.isFinite(Number(raw))) override[key] = Number(raw);
+    }
+  );
+
+  if (form.elements.enableTiers.checked) {
+    const tiers = normalizeTiers(readTiers(form.querySelector('#override-tiers')));
+    if (tiers.length === 0) {
+      toast('至少保留一个补仓档位', 'error');
+      return;
+    }
+    override.addTiers = tiers;
+  }
+
+  const effective = mergeStrategy(state.settings.defaultStrategy, override);
+  const errors = validateStrategy(effective);
+  if (errors.length > 0) {
+    toast(errors[0], 'error');
+    return;
+  }
+
+  fund.strategyOverride = Object.keys(override).length > 0 ? override : null;
+  const tierCount = effective.addTiers.length;
+  fund.tierState = Array.from({ length: tierCount }, (_, index) => Boolean((fund.tierState || [])[index]));
+  store.save(state);
+  hideSheet();
+  render();
+  toast('该基金的策略覆盖已保存', 'success');
+}
+
+function handleTrade(form) {
+  const fund = getFund(form.dataset.fund);
+  if (!fund) return;
+
+  const type = form.elements.type.value === 'SELL' ? 'SELL' : 'BUY';
+  const date = form.elements.date.value || todayISO();
+  const nav = num(form.elements.nav.value);
+  const amount = num(form.elements.amount.value);
+  const fee = num(form.elements.fee.value);
+  const sharesInput = num(form.elements.shares.value);
+  const shares = sharesInput > 0 ? sharesInput : nav > 0 ? amount / nav : 0;
+
+  if (nav <= 0) {
+    toast('请填写有效的成交净值', 'error');
+    return;
+  }
+  if (amount <= 0 && shares <= 0) {
+    toast('请填写金额或份额', 'error');
+    return;
+  }
+
+  const metrics = metricsFor(fund);
+  if (type === 'SELL' && shares > metrics.position.shares + 1e-6) {
+    toast('卖出份额超过当前持仓', 'error');
+    return;
+  }
+
+  const tierIndexRaw = String(form.elements.tierIndex.value || '');
+  const trade = {
+    id: store.uid(),
+    type,
+    date,
+    nav,
+    amount: amount > 0 ? amount : shares * nav,
+    shares,
+    fee,
+    source: form.elements.source.value === 'ADD' ? 'ADD' : 'BASE',
+    tierIndex: tierIndexRaw === '' ? null : Number(tierIndexRaw),
+    note: String(form.elements.note.value || '').trim(),
+    closed: false,
+    createdAt: Date.now()
+  };
+
+  fund.trades.push(trade);
+
+  if (type === 'BUY' && trade.source === 'ADD' && Number.isInteger(trade.tierIndex)) {
+    while (fund.tierState.length <= trade.tierIndex) fund.tierState.push(false);
+    fund.tierState[trade.tierIndex] = true;
+  }
+
+  const batchId = String(form.elements.batchId.value || '');
+  if (batchId) {
+    const batch = fund.trades.find((item) => item.id === batchId);
+    if (batch) batch.closed = true;
+  }
+
+  store.save(state);
+  hideSheet();
+  render();
+  toast(type === 'SELL' ? '卖出已登记' : '买入已登记', 'success');
+}
+
+function handleManualNav(form) {
+  const fund = getFund(form.dataset.fund);
+  if (!fund) return;
+  const nav = num(form.elements.nav.value);
+  const navDate = form.elements.navDate.value || todayISO();
+  if (nav <= 0) {
+    toast('请输入有效净值', 'error');
+    return;
+  }
+
+  fund.nav = nav;
+  fund.navDate = navDate;
+  fund.navUpdatedAt = Date.now();
+  const history = Array.isArray(fund.navHistory) ? fund.navHistory : [];
+  const index = history.findIndex((item) => item.date === navDate);
+  if (index >= 0) history[index] = { date: navDate, nav };
+  else history.push({ date: navDate, nav });
+  history.sort((a, b) => a.date.localeCompare(b.date));
+  fund.navHistory = history.slice(-365);
+
+  store.save(state);
+  hideSheet();
+  render();
+  toast('净值已更新', 'success');
+}
+
+async function lookupFund(button) {
+  const form = button.closest('form');
+  if (!form) return;
+  const code = String(form.elements.code.value || '').trim();
+  const status = form.querySelector('#lookup-status');
+  if (!isFundCode(code)) {
+    if (status) {
+      status.textContent = '请输入 6 位基金代码';
+      status.dataset.tone = 'error';
+    }
+    return;
+  }
+
+  button.disabled = true;
+  if (status) {
+    status.textContent = '查询中…';
+    status.dataset.tone = '';
+  }
+
+  try {
+    const quotes = await fetchQuotes([code]);
+    const quote = quotes.get(code);
+    if (!quote || !(quote.nav > 0)) throw new Error('未查到该基金');
+    form.elements.name.value = quote.name || form.elements.name.value;
+    form.elements.nav.value = quote.nav.toFixed(4);
+    if (quote.navDate) form.elements.navDate.value = quote.navDate;
+    if (!num(form.elements.buyNav.value)) form.elements.buyNav.value = quote.nav.toFixed(4);
+    if (status) {
+      status.textContent = `${quote.name} · ${quote.navDate} · ${quote.nav.toFixed(4)}`;
+      status.dataset.tone = 'ok';
+    }
+  } catch (error) {
+    if (status) {
+      status.textContent = `查询失败：${error.message}`;
+      status.dataset.tone = 'error';
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function deleteFund(fundId) {
+  const fund = getFund(fundId);
+  if (!fund) return;
+  const ok = await confirmDialog({
+    title: '删除基金',
+    message: `确定删除「${fund.name || fund.code}」及其全部交易记录吗？此操作不可恢复。`,
+    confirmText: '删除',
+    danger: true
+  });
+  if (!ok) return;
+  state.funds = state.funds.filter((item) => item.id !== fundId);
+  store.save(state);
+  if (parseRoute().name === 'detail') location.hash = '#/holdings';
+  else render();
+  toast('已删除', 'success');
+}
+
+async function deleteTrade(fundId, tradeId) {
+  const fund = getFund(fundId);
+  const trade = fund && fund.trades.find((item) => item.id === tradeId);
+  if (!fund || !trade) return;
+  const ok = await confirmDialog({
+    title: '删除交易记录',
+    message: '删除后持仓成本与规则线会重新计算，确定继续吗？',
+    confirmText: '删除',
+    danger: true
+  });
+  if (!ok) return;
+  fund.trades = fund.trades.filter((item) => item.id !== tradeId);
+  store.save(state);
+  render();
+  toast('记录已删除', 'success');
+}
+
+async function resetTiers(fundId) {
+  const fund = getFund(fundId);
+  if (!fund) return;
+  const ok = await confirmDialog({
+    title: '重置补仓档位',
+    message: '所有档位将恢复为「未执行」，用于新一轮计划。',
+    confirmText: '重置'
+  });
+  if (!ok) return;
+  fund.tierState = (metricsFor(fund).strategy.addTiers || []).map(() => false);
+  commit();
+  toast('档位已重置', 'success');
+}
+
+function handleExport() {
+  downloadText(`fundpilot-${todayISO()}.json`, store.exportPayload(state));
+  toast('备份已导出', 'success');
+}
+
+async function handleImportFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const imported = store.importPayload(text);
+    const ok = await confirmDialog({
+      title: '导入备份',
+      message: `将用备份中的 ${imported.funds.length} 只基金覆盖当前本地数据，确定继续吗？`,
+      confirmText: '覆盖导入',
+      danger: true
+    });
+    if (!ok) return;
+    state = imported;
+    store.save(state);
+    render();
+    toast('备份已导入', 'success');
+  } catch (error) {
+    toast(`导入失败：${error.message}`, 'error');
+  } finally {
+    input.value = '';
+  }
+}
+
+async function clearAllData() {
+  const ok = await confirmDialog({
+    title: '清空全部数据',
+    message: '所有基金、交易与策略设置都会被删除，且无法恢复。建议先导出备份。',
+    confirmText: '清空',
+    danger: true
+  });
+  if (!ok) return;
+  store.clear();
+  state = store.defaultState();
+  store.save(state);
+  location.hash = '#/holdings';
+  render();
+  toast('数据已清空', 'success');
+}
+
+document.addEventListener('click', (event) => {
+  const target = event.target.closest('[data-action]');
+  if (!target) return;
+  const action = target.dataset.action;
+
+  switch (action) {
+    case 'close-sheet':
+      hideSheet();
+      break;
+    case 'back':
+      if (window.history.length > 1) window.history.back();
+      else location.hash = '#/holdings';
+      break;
+    case 'add-fund':
+      openAddFund();
+      break;
+    case 'lookup-fund':
+      lookupFund(target);
+      break;
+    case 'refresh-all':
+      refreshFunds();
+      break;
+    case 'refresh-fund':
+      refreshFunds([target.dataset.fund]);
+      break;
+    case 'open-fund':
+      location.hash = `#/fund/${target.dataset.id}`;
+      break;
+    case 'tier-trade': {
+      openTrade(target.dataset.fund, {
+        source: 'ADD',
+        tierIndex: Number(target.dataset.tier),
+        amount: Number(target.dataset.amount) || 0,
+        note: `第 ${Number(target.dataset.tier) + 1} 档补仓`
+      });
+      break;
+    }
+    case 'add-trade':
+      openTrade(target.dataset.fund, { source: 'BASE' });
+      break;
+    case 'close-batch': {
+      const fundId = target.dataset.fund;
+      const fund = getFund(fundId);
+      if (!fund) break;
+      const shares = num(target.dataset.shares);
+      openTrade(fundId, {
+        type: 'SELL',
+        shares,
+        amount: shares * (num(fund.nav) || 1),
+        batchId: target.dataset.trade,
+        note: '补仓批次独立了结'
+      });
+      break;
+    }
+    case 'manual-nav': {
+      const fund = getFund(target.dataset.fund);
+      if (fund) {
+        showSheet({
+          title: '手动录入净值',
+          subtitle: fund.name || fund.code,
+          body: views.manualNavSheetBody(fund)
+        });
+      }
+      break;
+    }
+    case 'override': {
+      const fund = getFund(target.dataset.fund);
+      if (fund) {
+        showSheet({
+          title: '策略覆盖',
+          subtitle: '留空继承全局模板',
+          body: views.overrideSheetBody(fund, metricsFor(fund).strategy),
+          tall: true
+        });
+      }
+      break;
+    }
+    case 'clear-override': {
+      const fund = getFund(target.dataset.fund);
+      if (!fund) break;
+      fund.strategyOverride = null;
+      normalizeTierState(fund);
+      store.save(state);
+      hideSheet();
+      render();
+      toast('已恢复跟随全局模板', 'success');
+      break;
+    }
+    case 'reset-tiers':
+      resetTiers(target.dataset.fund);
+      break;
+    case 'delete-fund':
+      deleteFund(target.dataset.fund);
+      break;
+    case 'delete-trade':
+      deleteTrade(target.dataset.fund, target.dataset.trade);
+      break;
+    case 'add-tier': {
+      const container = document.querySelector(target.dataset.target || '');
+      if (!container) break;
+      const rows = container.querySelectorAll('.tier-row');
+      const last = rows[rows.length - 1];
+      const lastDrop = last ? num(last.querySelector('[name="tierDrop"]').value) : 0;
+      const lastAmount = last ? num(last.querySelector('[name="tierAmount"]').value) : 0;
+      container.insertAdjacentHTML(
+        'beforeend',
+        views.tierRows([
+          { dropPct: lastDrop > 0 ? Math.min(lastDrop + 5, 95) : '', amount: lastAmount || '' }
+        ])
+      );
+      break;
+    }
+    case 'remove-tier': {
+      const row = target.closest('.tier-row');
+      if (row) row.remove();
+      break;
+    }
+    case 'export':
+      handleExport();
+      break;
+    case 'import': {
+      const input = document.getElementById('import-file');
+      if (input) input.click();
+      break;
+    }
+    case 'clear-data':
+      clearAllData();
+      break;
+    default:
+      break;
+  }
+});
+
+document.addEventListener('submit', (event) => {
+  const form = event.target.closest('form[data-form]');
+  if (!form) return;
+  event.preventDefault();
+
+  switch (form.dataset.form) {
+    case 'add-fund':
+      handleAddFund(form);
+      break;
+    case 'strategy':
+      handleStrategy(form);
+      break;
+    case 'override':
+      handleOverride(form);
+      break;
+    case 'add-trade':
+      handleTrade(form);
+      break;
+    case 'manual-nav':
+      handleManualNav(form);
+      break;
+    default:
+      break;
+  }
+});
+
+document.addEventListener('input', (event) => {
+  if (!event.target.matches('[data-sim]')) return;
+  if (!currentFundId) return;
+  const fund = getFund(currentFundId);
+  if (!fund) return;
+
+  const metrics = metricsFor(fund);
+  const amountInput = document.querySelector('[data-sim="amount"]');
+  const priceInput = document.querySelector('[data-sim="price"]');
+  if (!amountInput || !priceInput) return;
+
+  const result = simulateAdd(
+    metrics.position,
+    num(amountInput.value),
+    num(priceInput.value),
+    metrics.strategy
+  );
+  const box = document.getElementById('sim-result');
+  if (box) box.innerHTML = views.simResultHtml(result, metrics.strategy);
+});
+
+document.addEventListener('change', (event) => {
+  const toggle = event.target.closest('[data-action="toggle-logic"]');
+  if (toggle) {
+    const fund = getFund(toggle.dataset.fund);
+    if (fund) {
+      fund.logicIntact = Boolean(toggle.checked);
+      store.save(state);
+      render();
+    }
+    return;
+  }
+
+  if (event.target.id === 'import-file') {
+    handleImportFile(event.target);
+  }
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const card = event.target.closest('.fund-card[data-action="open-fund"]');
+  if (!card) return;
+  event.preventDefault();
+  location.hash = `#/fund/${card.dataset.id}`;
+});
+
+window.addEventListener('hashchange', render);
+
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  });
+}
+
+render();

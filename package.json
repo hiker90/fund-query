@@ -1,0 +1,11 @@
+{
+  "name": "fundpilot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地优先的基金持仓监控与分档补仓策略工具",
+  "scripts": {
+    "test": "node tests/strategy.test.mjs",
+    "serve": "python3 -m http.server 8000"
+  }
+}
