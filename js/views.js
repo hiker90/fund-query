@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation } from './strategy.js';
+import { simulateAdd, computeAllocation, parseBatchText } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -608,6 +608,7 @@ export function dataPage(state) {
       <section class="card">
         <h2 class="card-title">备份与迁移</h2>
         <div class="button-grid">
+          <button class="btn ghost" type="button" data-action="open-batch-import">批量导入底仓</button>
           <button class="btn ghost" type="button" data-action="export">导出 JSON 备份</button>
           <button class="btn ghost" type="button" data-action="import">导入 JSON 备份</button>
           <button class="btn ghost danger-text" type="button" data-action="clear-data">清空全部数据</button>
@@ -625,6 +626,75 @@ export function dataPage(state) {
         </p>
       </section>
     </main>`;
+}
+
+export function batchImportSheetBody() {
+  return `
+    <form class="form" data-form="batch-import">
+      <label class="field">
+        <span>持仓数据（每行：代码, 持仓金额, 持仓收益率）</span>
+        <textarea name="payload" rows="7"
+          placeholder="# 示例（收益率可省略，支持负数）&#10;110022,10500,5.2&#10;161725,8200,-3.1&#10;005827,12000"
+          autocomplete="off" spellcheck="false"></textarea>
+        <small>支持从 Excel 直接复制粘贴（逗号 / Tab 分隔）。名称与净值导入时自动联网查询。</small>
+      </label>
+      <div class="lookup-row">
+        <button class="btn ghost small" type="button" data-action="batch-parse">解析预览</button>
+        <span class="lookup-status" id="batch-parse-status"></span>
+      </div>
+      <div id="batch-preview"></div>
+      <button class="btn primary block" type="button" id="batch-import-btn" data-action="batch-import-confirm" hidden>确认导入</button>
+    </form>`;
+}
+
+export function batchPreviewHtml(result, state) {
+  const existing = new Set(state.funds.map((f) => f.code));
+  const items = [
+    ...result.rows.map((row) => ({
+      ...row,
+      status: existing.has(row.code) ? 'dup' : 'ok'
+    })),
+    ...result.errors.map((err) => ({ ...err, status: 'error' }))
+  ].sort((a, b) => a.lineNo - b.lineNo);
+
+  if (!items.length) return '<p class="empty-inline">没有解析到有效数据行。</p>';
+
+  const rows = items
+    .map((item) => {
+      if (item.status === 'error') {
+        return `
+        <div class="batch-row is-error">
+          <span class="batch-line">L${item.lineNo}</span>
+          <span class="batch-code">${esc(item.code || '—')}</span>
+          <span class="batch-reason">${esc(item.reason)}</span>
+        </div>`;
+      }
+      if (item.status === 'dup') {
+        return `
+        <div class="batch-row is-dup">
+          <span class="batch-line">L${item.lineNo}</span>
+          <span class="batch-code">${esc(item.code)}</span>
+          <span class="batch-reason">已在监控列表，将跳过</span>
+        </div>`;
+      }
+      return `
+        <div class="batch-row is-ok">
+          <span class="batch-line">L${item.lineNo}</span>
+          <span class="batch-code">${esc(item.code)}</span>
+          <span class="batch-detail num">¥${fmtMoney(item.amount)} · ${fmtPct(item.returnPct)}</span>
+        </div>`;
+    })
+    .join('');
+
+  const okCount = result.rows.filter((r) => !existing.has(r.code)).length;
+  const dupCount = result.rows.length - okCount;
+  const summary = `可导入 ${okCount} 只${dupCount ? `，重复跳过 ${dupCount} 只` : ''}${
+    result.errors.length ? `，错误 ${result.errors.length} 行` : ''
+  }`;
+
+  return `
+    <div class="batch-summary">${summary}</div>
+    <div class="batch-list">${rows}</div>`;
 }
 
 export function addFundSheetBody(categories = []) {

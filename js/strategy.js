@@ -409,3 +409,58 @@ export function computeAllocation(state, metricsMap) {
     uncategorizedPct
   };
 }
+
+/**
+ * 解析批量导入文本。极致精简格式：每行 3 列「代码,持仓金额,持仓收益率」。
+ * - 分隔符支持半角逗号、中文逗号、制表符（可直接从 Excel 复制粘贴）
+ * - 首行若是表头（首格不是 6 位数字）自动跳过
+ * - 「#」或「//」开头的行视为注释
+ * - 收益率可省略，省略时按 0 处理；支持负数（亏损）
+ * 返回 { rows, errors }，rows 内同代码去重（保留最后一次出现）
+ */
+export function parseBatchText(text) {
+  const rows = [];
+  const errors = [];
+  const lines = String(text || '').split(/\r?\n/);
+
+  lines.forEach((rawLine, idx) => {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#') || line.startsWith('//')) return;
+
+    const lineNo = idx + 1;
+    const cells = line.split(/[,\t，、]/).map((c) => c.trim());
+    const firstCell = cells[0] || '';
+
+    // 表头行：仅在首格包含非数字字符（如「代码」「code」）时跳过
+    if (rows.length === 0 && errors.length === 0 && firstCell !== '' && /[^\d\s]/.test(firstCell)) return;
+
+    const code = firstCell;
+    if (!/^\d{6}$/.test(code)) {
+      errors.push({ lineNo, code, reason: '代码必须是 6 位数字' });
+      return;
+    }
+
+    const amount = Number(cells[1]);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      errors.push({ lineNo, code, reason: '持仓金额必须大于 0' });
+      return;
+    }
+
+    let returnPct = 0;
+    if (cells.length >= 3 && cells[2] !== '') {
+      returnPct = Number(cells[2]);
+      if (!Number.isFinite(returnPct)) {
+        errors.push({ lineNo, code, reason: `收益率「${cells[2]}」不是数字` });
+        return;
+      }
+    }
+
+    rows.push({ code, amount, returnPct, lineNo });
+  });
+
+  // 同代码去重，保留最后一行
+  const byCode = new Map();
+  for (const row of rows) byCode.set(row.code, row);
+
+  return { rows: [...byCode.values()], errors };
+}

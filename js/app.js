@@ -4,6 +4,7 @@ import {
   mergeStrategy,
   normalizeTiers,
   num,
+  parseBatchText,
   simulateAdd,
   validateStrategy
 } from './strategy.js';
@@ -161,6 +162,133 @@ function openAddFund() {
     body: views.addFundSheetBody(state.categories || []),
     tall: true
   });
+}
+
+let batchParsed = null;
+
+function openBatchImport() {
+  batchParsed = null;
+  showSheet({
+    title: '批量导入底仓',
+    subtitle: '每行：代码, 持仓金额, 持仓收益率',
+    body: views.batchImportSheetBody(),
+    tall: true
+  });
+}
+
+function handleBatchParse() {
+  const form = document.querySelector('form[data-form="batch-import"]');
+  if (!form) return;
+  const text = String(form.elements.payload.value || '');
+  const status = form.querySelector('#batch-parse-status');
+  const previewBox = form.querySelector('#batch-preview');
+  const confirmBtn = form.querySelector('#batch-import-btn');
+
+  if (!text.trim()) {
+    if (status) {
+      status.textContent = '请先粘贴持仓数据';
+      status.dataset.tone = 'error';
+    }
+    return;
+  }
+
+  batchParsed = parseBatchText(text);
+  if (previewBox) previewBox.innerHTML = views.batchPreviewHtml(batchParsed, state);
+  if (confirmBtn) confirmBtn.hidden = batchParsed.rows.length === 0;
+
+  if (status) {
+    if (batchParsed.rows.length === 0) {
+      status.textContent = '未解析到有效数据行';
+      status.dataset.tone = 'error';
+    } else {
+      status.textContent = `解析到 ${batchParsed.rows.length} 只基金`;
+      status.dataset.tone = 'ok';
+    }
+  }
+}
+
+async function confirmBatchImport() {
+  if (!batchParsed || !batchParsed.rows.length) return;
+  const form = document.querySelector('form[data-form="batch-import"]');
+  const confirmBtn = form?.querySelector('#batch-import-btn');
+  if (confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = '查询净值并导入…';
+  }
+
+  try {
+    const rows = batchParsed.rows;
+    const quotes = await fetchQuotes(rows.map((r) => r.code));
+    const today = todayISO();
+    const newFunds = [];
+    const noNavCodes = [];
+
+    for (const row of rows) {
+      // 跳过已有基金
+      if (state.funds.some((f) => f.code === row.code)) continue;
+      const quote = quotes.get(row.code);
+      const nav = quote && quote.nav > 0 ? quote.nav : 0;
+      const navDate = nav > 0 && quote.navDate ? quote.navDate : today;
+
+      const fund = {
+        id: store.uid(),
+        code: row.code,
+        name: (quote && quote.name) || `基金 ${row.code}`,
+        category: '',
+        nav,
+        navDate: nav > 0 ? navDate : '',
+        navUpdatedAt: nav > 0 ? Date.now() : 0,
+        navHistory: nav > 0 ? [{ date: navDate, nav }] : [],
+        strategyOverride: null,
+        trades: [],
+        tierState: (state.settings.defaultStrategy.addTiers || []).map(() => false),
+        logicIntact: true
+      };
+
+      if (nav > 0) {
+        // 市值 + 收益率 反推底仓：成本 = 市值 / (1 + r)；份额 = 市值 / 净值
+        const shares = row.amount / nav;
+        const cost = row.amount / (1 + row.returnPct / 100);
+        const buyNav = cost / shares;
+        fund.trades.push({
+          id: store.uid(),
+          type: 'BUY',
+          date: today,
+          nav: buyNav,
+          amount: cost,
+          shares,
+          fee: 0,
+          source: 'BASE',
+          tierIndex: null,
+          note: '批量导入底仓',
+          closed: false,
+          createdAt: Date.now()
+        });
+      } else {
+        noNavCodes.push(row.code);
+      }
+      newFunds.push(fund);
+    }
+
+    if (newFunds.length) {
+      state.funds.push(...newFunds);
+      store.save(state);
+    }
+    batchParsed = null;
+    hideSheet();
+    render();
+
+    const okCount = newFunds.length - noNavCodes.length;
+    let msg = `导入完成：${okCount} 只已登记底仓`;
+    if (noNavCodes.length) msg += `，${noNavCodes.length} 只（${noNavCodes.join('、')}）未查到净值，仅添加监控无底仓`;
+    toast(msg, okCount ? 'success' : 'warn');
+  } catch (error) {
+    if (confirmBtn) {
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = '确认导入';
+    }
+    toast(`导入失败：${error.message}`, 'error');
+  }
 }
 
 function openTrade(fundId, preset = {}) {
@@ -604,6 +732,15 @@ document.addEventListener('click', (event) => {
       break;
     case 'add-fund':
       openAddFund();
+      break;
+    case 'open-batch-import':
+      openBatchImport();
+      break;
+    case 'batch-parse':
+      handleBatchParse();
+      break;
+    case 'batch-import-confirm':
+      confirmBatchImport();
       break;
     case 'lookup-fund':
       lookupFund(target);
