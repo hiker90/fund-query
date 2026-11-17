@@ -9,6 +9,7 @@ import {
   validateStrategy
 } from './strategy.js';
 import { fetchQuotes, isFundCode } from './quote.js';
+import { fetchMacroData } from './macro.js';
 import * as views from './views.js';
 import {
   confirmDialog,
@@ -23,16 +24,35 @@ let state = store.load();
 let refreshing = false;
 let currentFundId = null;
 let lastRouteKey = '';
+let macroData = null;
+let macroLoading = false;
+const expandedAllocCats = new Set();
+let holdingsFilter = 'all';
+
+async function loadMacro({ force = false } = {}) {
+  if (macroLoading) return;
+  macroLoading = true;
+  if (parseRoute().name === 'macro') render();
+  try {
+    const data = await fetchMacroData({ force });
+    macroData = data;
+    if (parseRoute().name === 'macro') render();
+  } finally {
+    macroLoading = false;
+  }
+}
 
 const app = document.getElementById('app');
 
 function parseRoute() {
   const hash = String(location.hash || '').replace(/^#/, '');
   if (hash.startsWith('/fund/')) return { name: 'detail', id: hash.slice('/fund/'.length) };
+  if (hash === '/holdings') return { name: 'holdings' };
   if (hash === '/strategy') return { name: 'strategy' };
   if (hash === '/allocation') return { name: 'allocation' };
   if (hash === '/data') return { name: 'data' };
-  return { name: 'holdings' };
+  if (hash === '/macro') return { name: 'macro' };
+  return { name: 'macro' };
 }
 
 function getFund(id) {
@@ -74,13 +94,21 @@ function render() {
     app.innerHTML = views.strategyPage(state);
   } else if (route.name === 'allocation') {
     currentFundId = null;
-    app.innerHTML = views.allocationPage(state, buildMetricsMap());
+    app.innerHTML = views.allocationPage(state, buildMetricsMap(), expandedAllocCats);
   } else if (route.name === 'data') {
     currentFundId = null;
     app.innerHTML = views.dataPage(state);
+  } else if (route.name === 'macro') {
+    currentFundId = null;
+    app.innerHTML = views.macroPage(macroData, { refreshing: macroLoading });
+    if (!macroData && !macroLoading) {
+      loadMacro().catch((error) => {
+        toast(`宏观数据加载失败：${error.message}`, 'error');
+      });
+    }
   } else {
     currentFundId = null;
-    app.innerHTML = views.holdingsPage(state, buildMetricsMap(), { refreshing });
+    app.innerHTML = views.holdingsPage(state, buildMetricsMap(), { refreshing, filter: holdingsFilter });
   }
 
   updateTabs(route);
@@ -717,11 +745,18 @@ async function clearAllData() {
   toast('数据已清空', 'success');
 }
 
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const el = event.target.closest('[data-action="toggle-alloc"]');
+  if (!el) return;
+  event.preventDefault();
+  el.click();
+});
+
 document.addEventListener('click', (event) => {
   const target = event.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action;
-
   switch (action) {
     case 'close-sheet':
       hideSheet();
@@ -741,6 +776,26 @@ document.addEventListener('click', (event) => {
       break;
     case 'batch-import-confirm':
       confirmBatchImport();
+      break;
+    case 'macro-refresh':
+      loadMacro({ force: true })
+        .catch((error) => toast(`宏观数据加载失败：${error.message}`, 'error'))
+        .finally(() => {
+          if (parseRoute().name === 'macro') render();
+        });
+      break;
+    case 'toggle-alloc': {
+      const catName = target.closest('[data-category]')?.dataset.category;
+      if (catName) {
+        if (expandedAllocCats.has(catName)) expandedAllocCats.delete(catName);
+        else expandedAllocCats.add(catName);
+        render();
+      }
+      break;
+    }
+    case 'filter-holdings':
+      holdingsFilter = target.dataset.filter || 'all';
+      render();
       break;
     case 'lookup-fund':
       lookupFund(target);

@@ -24,6 +24,22 @@ export function statusMeta(status) {
   return STATUS_META[status] || STATUS_META.normal;
 }
 
+const HOLDINGS_FILTERS = [
+  { key: 'all', label: '全部', match: () => true },
+  { key: 'add', label: '可补仓', match: (m) => m.status === 'add' },
+  {
+    key: 'take',
+    label: '止盈',
+    match: (m) => m.status === 'takeProfit' || m.status === 'trailing'
+  },
+  {
+    key: 'stop',
+    label: '止损',
+    match: (m) => m.status === 'stop' || m.status === 'nearStop'
+  },
+  { key: 'normal', label: '运行中', match: (m) => m.status === 'normal' }
+];
+
 function badge(metrics) {
   const meta = statusMeta(metrics.status);
   return `<span class="badge badge-${meta.tone}">${esc(meta.label)}</span>`;
@@ -121,7 +137,7 @@ function emptyState() {
     </div>`;
 }
 
-export function holdingsPage(state, metricsMap, { refreshing = false } = {}) {
+export function holdingsPage(state, metricsMap, { refreshing = false, filter = 'all' } = {}) {
   const metricsList = state.funds
     .map((fund) => metricsMap.get(fund.id))
     .filter(Boolean)
@@ -145,6 +161,21 @@ export function holdingsPage(state, metricsMap, { refreshing = false } = {}) {
         minute: '2-digit'
       })
     : '尚未刷新';
+
+  const activeFilter = HOLDINGS_FILTERS.find((f) => f.key === filter) || HOLDINGS_FILTERS[0];
+  const filteredList = metricsList.filter(activeFilter.match);
+  const filterTabs = HOLDINGS_FILTERS.map((f) => {
+    const count = metricsList.filter(f.match).length;
+    return `
+      <button class="filter-tab${f.key === activeFilter.key ? ' is-active' : ''}" type="button"
+        data-action="filter-holdings" data-filter="${f.key}">
+        ${esc(f.label)}${count ? ` <em>${count}</em>` : ''}
+      </button>`;
+  }).join('');
+
+  const filterBar = metricsList.length
+    ? `<div class="filter-tabs" role="tablist" aria-label="按状态筛选基金">${filterTabs}</div>`
+    : '';
 
   return `
     <header class="topbar">
@@ -179,10 +210,13 @@ export function holdingsPage(state, metricsMap, { refreshing = false } = {}) {
         <p class="hero-note">${metricsList.length} 只基金 · 净值更新 ${esc(updatedLabel)}</p>
       </section>
 
+      ${filterBar}
       ${
-        metricsList.length
-          ? `<section class="fund-list">${metricsList.map(fundCard).join('')}</section>`
-          : emptyState()
+        filteredList.length
+          ? `<section class="fund-list">${filteredList.map(fundCard).join('')}</section>`
+          : metricsList.length
+            ? `<div class="empty-state compact"><p>「${esc(activeFilter.label)}」状态下暂无基金</p></div>`
+            : emptyState()
       }
       <p class="footnote">数据仅保存在本机浏览器，不构成投资建议。</p>
     </main>
@@ -628,6 +662,149 @@ export function dataPage(state) {
     </main>`;
 }
 
+function macroMetricRow(label, valueText, changeText, toneCls) {
+  const changeHtml = changeText
+    ? `<span class="num ${toneCls}">${esc(changeText)}</span>`
+    : '<span class="num muted">—</span>';
+  return `
+    <div class="macro-row">
+      <span class="macro-label">${esc(label)}</span>
+      <span class="macro-value num">${esc(valueText)}</span>
+      ${changeHtml}
+    </div>`;
+}
+
+function percentileBarHtml(pct, label) {
+  if (pct == null || !Number.isFinite(pct)) {
+    return '<p class="muted">历史分位数据不可用。</p>';
+  }
+  const pos = Math.min(100, Math.max(0, pct));
+  return `
+    <div class="pct-block">
+      <div class="pct-head">
+        <span>${esc(label)}</span>
+        <b class="num">${fmtPct(pct, { signed: false })}</b>
+      </div>
+      <div class="pct-track">
+        <div class="pct-fill" style="width:${pos.toFixed(1)}%"></div>
+      </div>
+      <div class="pct-scale"><span>0%</span><span>50%</span><span>100%</span></div>
+    </div>`;
+}
+
+function macroPageHead(refreshing) {
+  return `
+    <header class="topbar">
+      <div class="topbar-row">
+        <div>
+          <p class="eyebrow">FundPilot</p>
+          <h1>宏观观察</h1>
+        </div>
+        <button class="icon-btn${refreshing ? ' is-busy' : ''}" type="button" data-action="macro-refresh"
+          ${refreshing ? 'disabled' : ''} aria-label="刷新宏观数据">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M20 12a8 8 0 1 1-2.34-5.66"/>
+            <path d="M20 4v5h-5"/>
+          </svg>
+        </button>
+      </div>
+    </header>`;
+}
+
+export function macroPage(data, { refreshing = false } = {}) {
+  if (!data) {
+    return `
+    ${macroPageHead(refreshing)}
+    <main class="page">
+      <section class="card macro-loading">
+        <div class="spinner"></div>
+        <p class="muted">正在加载宏观数据…</p>
+      </section>
+    </main>`;
+  }
+
+  const chg = (item, unit = '') => {
+    if (!item || !Number.isFinite(item.changePct) || item.changePct === 0) return { text: '', cls: '' };
+    const cls = item.changePct > 0 ? 'up' : 'down';
+    return { text: `${item.changePct > 0 ? '+' : ''}${item.changePct.toFixed(2)}${unit}`, cls };
+  };
+
+  // 1. 美债与美元
+  const us = chg(data.us10y, '%');
+  const dx = chg(data.dxy, '%');
+  const cardUs = `
+    <section class="card macro-card grad-blue">
+      <h2 class="card-title">美债与美元</h2>
+      ${macroMetricRow('美国10年期国债收益率', data.us10y.price > 0 ? `${data.us10y.price.toFixed(2)}%` : '—', us.text, us.cls)}
+      ${macroMetricRow('美元指数', data.dxy.price > 0 ? data.dxy.price.toFixed(2) : '—', dx.text, dx.cls)}
+    </section>`;
+
+  // 2. 中国国债与利差
+  const cn = chg(data.cn10y, '%');
+  let spreadText = '—';
+  let spreadCls = '';
+  if (Number.isFinite(data.cnUsSpreadBp)) {
+    spreadText = `${data.cnUsSpreadBp > 0 ? '+' : ''}${Math.round(data.cnUsSpreadBp)} bp`;
+    spreadCls = data.cnUsSpreadBp >= 0 ? 'up' : 'down';
+  }
+  const cardCn = `
+    <section class="card macro-card grad-teal">
+      <h2 class="card-title">中国国债与利差</h2>
+      ${macroMetricRow('中国10年期国债收益率', data.cn10y.price > 0 ? `${data.cn10y.price.toFixed(2)}%` : '—', cn.text, cn.cls)}
+      ${macroMetricRow('中美10年期利差（参考）', spreadText, '', spreadCls)}
+      <p class="macro-note">中债企业债信用利差暂无免费公开数据源，以中美10年期国债利差作为跨境利差参考。</p>
+    </section>`;
+
+  // 3. 股债性价比
+  const eb = data.equityBond;
+  let cardEb;
+  if (eb) {
+    cardEb = `
+    <section class="card macro-card grad-violet">
+      <h2 class="card-title">股债性价比（沪深300）</h2>
+      ${macroMetricRow('盈利收益率（1/PE）', `${eb.earningsYield.toFixed(2)}%`)}
+      ${macroMetricRow('PE-TTM', data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—')}
+      ${macroMetricRow('股债收益比', eb.ratio.toFixed(2))}
+      ${macroMetricRow('风险溢价 ERP', `${eb.erp >= 0 ? '+' : ''}${eb.erp.toFixed(2)}%`)}
+      ${percentileBarHtml(eb.ratioPercentile, '股债收益比 5 年分位')}
+      <p class="macro-note">分位基于近 5 年日频数据（样本 ${eb.sampleSize} 个），盈利收益率采用当前盈利近似估算。</p>
+    </section>`;
+  } else {
+    cardEb = `
+    <section class="card macro-card grad-violet">
+      <h2 class="card-title">股债性价比（沪深300）</h2>
+      <p class="muted">历史序列暂不可用，请稍后刷新重试。</p>
+    </section>`;
+  }
+
+  // 4. 大宗商品
+  const gd = chg(data.gold, '%');
+  const ol = chg(data.oil, '%');
+  const cardCm = `
+    <section class="card macro-card grad-gold">
+      <h2 class="card-title">大宗商品</h2>
+      ${macroMetricRow('COMEX 黄金', data.gold.price > 0 ? `$${data.gold.price.toFixed(1)}` : '—', gd.text, gd.cls)}
+      ${macroMetricRow('NYMEX 原油', data.oil.price > 0 ? `$${data.oil.price.toFixed(2)}` : '—', ol.text, ol.cls)}
+    </section>`;
+
+  const updated = new Date(data.updatedAt).toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+
+  return `
+    ${macroPageHead(refreshing)}
+    <main class="page">
+      ${cardUs}
+      ${cardCn}
+      ${cardEb}
+      ${cardCm}
+      <p class="footnote">数据来源：东方财富公开接口 · 更新于 ${esc(updated)} · 仅供参考，不构成投资建议。</p>
+    </main>`;
+}
+
 export function batchImportSheetBody() {
   return `
     <form class="form" data-form="batch-import">
@@ -857,14 +1034,6 @@ function fmtFundName(fund) {
   return `${fund.name || '—'} · ${fund.code}`;
 }
 
-function deviationClass(deviation) {
-  if (!Number.isFinite(deviation)) return '';
-  const abs = Math.abs(deviation);
-  if (abs < 1) return '';
-  if (abs < 5) return deviation > 0 ? 'mild-over' : 'mild-under';
-  return deviation > 0 ? 'is-over' : 'is-under';
-}
-
 const PIE_COLORS = ['#0a6cff', '#34c759', '#ff9f0a', '#af52de', '#ff375f', '#5ac8fa', '#ffd60a', '#8e8e93'];
 
 function rebalanceHtml(cat) {
@@ -880,9 +1049,21 @@ function rebalanceHtml(cat) {
 function allocPieHtml(alloc) {
   const segments = alloc.categories
     .filter((c) => c.actualValue > 0)
-    .map((c) => ({ name: c.name, value: c.actualValue, pct: c.actualPct }));
+    .map((c) => ({
+      name: c.name,
+      value: c.actualValue,
+      pct: c.actualPct,
+      targetPct: c.targetPct,
+      deviation: c.deviation
+    }));
   if (alloc.uncategorizedValue > 0) {
-    segments.push({ name: '未分类', value: alloc.uncategorizedValue, pct: alloc.uncategorizedPct });
+    segments.push({
+      name: '未分类',
+      value: alloc.uncategorizedValue,
+      pct: alloc.uncategorizedPct,
+      targetPct: 0,
+      deviation: null
+    });
   }
   if (!segments.length) return '';
 
@@ -903,14 +1084,29 @@ function allocPieHtml(alloc) {
     .join('');
 
   const legend = segments
-    .map(
-      (seg, i) => `
+    .map((seg, i) => {
+      const color = PIE_COLORS[i % PIE_COLORS.length];
+      // 偏差条：中线=目标，向左延伸=低配（绿），向右延伸=超配（红）
+      let devBar = '';
+      if (seg.targetPct > 0 && Number.isFinite(seg.deviation) && Math.abs(seg.deviation) >= 0.05) {
+        const span = Math.max(seg.targetPct, seg.pct);
+        const width = Math.min(50, (Math.abs(seg.deviation) / span) * 50);
+        const dir = seg.deviation > 0 ? 'over' : 'under';
+        const tip = `目标 ${seg.targetPct.toFixed(1)}% · 实际 ${seg.pct.toFixed(1)}%（${dir === 'over' ? '超配' : '低配'} ${Math.abs(seg.deviation).toFixed(1)}%）`;
+        devBar = `
+        <div class="pie-dev-track" title="${tip}">
+          <div class="pie-dev-center"></div>
+          <div class="pie-dev-fill ${dir}" style="width:${width.toFixed(1)}%"></div>
+        </div>`;
+      }
+      return `
       <div class="pie-legend-item">
-        <i style="background:${PIE_COLORS[i % PIE_COLORS.length]}"></i>
+        <i style="background:${color}"></i>
         <span class="pie-legend-name">${esc(seg.name)}</span>
         <b class="num">${fmtPct(seg.pct, { signed: false })}</b>
-      </div>`
-    )
+        ${devBar}
+      </div>`;
+    })
     .join('');
 
   return `
@@ -923,10 +1119,11 @@ function allocPieHtml(alloc) {
         </div>
         <div class="pie-legend">${legend}</div>
       </div>
+      <p class="macro-note">图例进度条以中线为目标基准：<span class="dev-under">向左绿色</span>=低配，<span class="dev-over">向右红色</span>=超配。</p>
     </section>`;
 }
 
-export function allocationPage(state, metricsMap) {
+export function allocationPage(state, metricsMap, expandedCats = new Set()) {
   const alloc = computeAllocation(state, metricsMap);
   const targetTotalDeviation = Math.abs(alloc.configuredTargetTotal - 100);
   const targetTone =
@@ -939,15 +1136,16 @@ export function allocationPage(state, metricsMap) {
   const categoryRows = alloc.categories.length
     ? alloc.categories
         .map((cat) => {
-          // 条形图：灰底全宽=100%，目标线一条竖线，实际填充一段
+          // 条形图：渐变轨道同持仓页 rule-track，竖线=目标，圆点=实际占比
           const barTargetLeft = cat.targetPct; // 目标线位置 0~100
           const barActualWidth = Math.min(cat.actualPct, 100);
-          const tone = deviationClass(cat.deviation);
           const sign = cat.deviation > 0 ? '+' : '';
+          const isOpen = expandedCats.has(cat.name);
           return `
-          <section class="alloc-row${cat.unconfigured ? ' is-unconfigured' : ''} ${tone ? toneClass(cat.deviation) : ''}"
+          <section class="alloc-row${cat.unconfigured ? ' is-unconfigured' : ''}${isOpen ? ' is-open' : ''}"
             data-category="${esc(cat.name)}">
-            <div class="alloc-head">
+            <div class="alloc-head" data-action="toggle-alloc" data-category="${esc(cat.name)}"
+              role="button" tabindex="0" aria-expanded="${isOpen}">
               <div class="alloc-head-left">
                 <b>${esc(cat.name)}</b>
                 ${cat.unconfigured ? '<span class="alloc-tag">未设目标</span>' : ''}
@@ -956,13 +1154,16 @@ export function allocationPage(state, metricsMap) {
               <div class="alloc-head-right">
                 <span class="num">${fmtMoney(cat.actualValue)}</span>
                 <span class="num ${toneClass(cat.deviation)}">${sign}${fmtPct(cat.deviation)}</span>
+                <svg class="alloc-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M9 6l6 6-6 6" />
+                </svg>
               </div>
             </div>
             ${rebalanceHtml(cat)}
             <div class="alloc-bar-wrap">
               <div class="alloc-bar-track">
-                <div class="alloc-bar-actual" style="width:${barActualWidth}%"></div>
-                <div class="alloc-bar-target" style="left:${barTargetLeft}%"></div>
+                <span class="alloc-bar-target" style="left:${barTargetLeft}%"></span>
+                <span class="alloc-bar-nav" style="left:${barActualWidth}%"></span>
               </div>
               <div class="alloc-bar-labels">
                 <span>实际 ${fmtPct(cat.actualPct, { signed: false })}</span>
@@ -971,7 +1172,7 @@ export function allocationPage(state, metricsMap) {
             </div>
             ${
               cat.funds.length > 0
-                ? `<div class="alloc-funds">
+                ? `<div class="alloc-funds"${isOpen ? '' : ' hidden'}>
                     ${cat.funds
                       .map(
                         (f) => `
