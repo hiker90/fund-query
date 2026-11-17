@@ -360,12 +360,16 @@ export function computeAllocation(state, metricsMap) {
     const actualPct = totalMarketValue > EPS ? (actualValue / totalMarketValue) * 100 : 0;
     const targetPct = num(config.targetPct);
     const deviation = actualPct - targetPct; // 正=超配，负=低配
+    // 再平衡金额：达到目标占比需要的调仓额。正=需买入，负=需卖出
+    const targetValue = (targetPct / 100) * totalMarketValue;
+    const adjustAmount = targetValue - actualValue;
     return {
       name: config.name,
       targetPct,
       actualValue,
       actualPct,
       deviation,
+      adjustAmount,
       fundCount: actual ? actual.fundCount : 0,
       funds: actual ? actual.funds : []
     };

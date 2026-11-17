@@ -627,8 +627,25 @@ export function dataPage(state) {
     </main>`;
 }
 
-export function addFundSheetBody() {
+export function addFundSheetBody(categories = []) {
   const today = todayISO();
+  const catOptions = categories.length
+    ? categories.map((c) => `<option value="${esc(c.name)}">${esc(c.name)}</option>`).join('')
+    : '';
+  const catSelect = catOptions
+    ? `<label class="field">
+        <span>资产类别</span>
+        <select name="category">
+          <option value="">未分类</option>
+          ${catOptions}
+        </select>
+        <small>可在底部「配置」页面管理类别和目标比例</small>
+      </label>`
+    : `<label class="field">
+        <span>资产类别</span>
+        <input type="text" name="category" placeholder="可留空，稍后在配置页面归类">
+        <small>暂无预设类别。可在此自由填写，或先去底部「配置」页面添加分类。</small>
+      </label>`;
   return `
     <form class="form" data-form="add-fund">
       <label class="field">
@@ -646,20 +663,21 @@ export function addFundSheetBody() {
         ${field({ label: '最新净值', name: 'nav', placeholder: '0.0000' })}
         ${field({ label: '净值日期', name: 'navDate', value: today, type: 'date', inputmode: 'none' })}
       </div>
+      ${catSelect}
 
       <h3 class="form-section">初始底仓（可跳过）</h3>
       <div class="segmented" data-toggle="base-mode">
-        <label><input type="radio" name="baseMode" value="trade" checked><span>成交金额 + 净值</span></label>
-        <label><input type="radio" name="baseMode" value="pnl"><span>市值 + 收益率</span></label>
+        <label><input type="radio" name="baseMode" value="trade"><span>成交金额 + 净值</span></label>
+        <label><input type="radio" name="baseMode" value="pnl" checked><span>市值 + 收益率</span></label>
       </div>
 
-      <div data-base-panel="trade">
+      <div data-base-panel="trade" hidden>
         <div class="field-grid">
           ${field({ label: '买入金额（元）', name: 'amount', placeholder: '10000' })}
           ${field({ label: '成交净值', name: 'buyNav', placeholder: '1.0000' })}
         </div>
       </div>
-      <div data-base-panel="pnl" hidden>
+      <div data-base-panel="pnl">
         <div class="field-grid">
           ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
           ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', hint: '正数=盈利，负数=亏损' })}
@@ -777,6 +795,67 @@ function deviationClass(deviation) {
   return deviation > 0 ? 'is-over' : 'is-under';
 }
 
+const PIE_COLORS = ['#0a6cff', '#34c759', '#ff9f0a', '#af52de', '#ff375f', '#5ac8fa', '#ffd60a', '#8e8e93'];
+
+function rebalanceHtml(cat) {
+  if (cat.unconfigured) return '';
+  const amt = Math.abs(cat.adjustAmount);
+  if (!Number.isFinite(amt) || amt < 1) return '<span class="rebal ok">已达标</span>';
+  const isBuy = cat.adjustAmount > 0;
+  const cls = isBuy ? 'buy' : 'sell';
+  const label = isBuy ? '需买入' : '需卖出';
+  return `<span class="rebal ${cls}">${label} ¥${fmtMoney(amt)}</span>`;
+}
+
+function allocPieHtml(alloc) {
+  const segments = alloc.categories
+    .filter((c) => c.actualValue > 0)
+    .map((c) => ({ name: c.name, value: c.actualValue, pct: c.actualPct }));
+  if (alloc.uncategorizedValue > 0) {
+    segments.push({ name: '未分类', value: alloc.uncategorizedValue, pct: alloc.uncategorizedPct });
+  }
+  if (!segments.length) return '';
+
+  const total = segments.reduce((sum, s) => sum + s.value, 0);
+  const R = 56;
+  const C = 2 * Math.PI * R;
+  let offset = 0;
+  const circles = segments
+    .map((seg, i) => {
+      const frac = seg.value / total;
+      const color = PIE_COLORS[i % PIE_COLORS.length];
+      const el = `<circle r="${R}" cx="75" cy="75" fill="none" stroke="${color}" stroke-width="26"
+        stroke-dasharray="${(frac * C).toFixed(2)} ${C.toFixed(2)}" stroke-dashoffset="${(-offset * C).toFixed(2)}"
+        transform="rotate(-90 75 75)"></circle>`;
+      offset += frac;
+      return el;
+    })
+    .join('');
+
+  const legend = segments
+    .map(
+      (seg, i) => `
+      <div class="pie-legend-item">
+        <i style="background:${PIE_COLORS[i % PIE_COLORS.length]}"></i>
+        <span class="pie-legend-name">${esc(seg.name)}</span>
+        <b class="num">${fmtPct(seg.pct, { signed: false })}</b>
+      </div>`
+    )
+    .join('');
+
+  return `
+    <section class="card">
+      <h2 class="card-title">持仓占比总览</h2>
+      <p class="card-sub">按当前市值统计各类别资金分布。</p>
+      <div class="pie-wrap">
+        <div class="pie-chart-box">
+          <svg viewBox="0 0 150 150" class="alloc-pie" role="img" aria-label="资产类别占比饼图">${circles}</svg>
+        </div>
+        <div class="pie-legend">${legend}</div>
+      </div>
+    </section>`;
+}
+
 export function allocationPage(state, metricsMap) {
   const alloc = computeAllocation(state, metricsMap);
   const targetTotalDeviation = Math.abs(alloc.configuredTargetTotal - 100);
@@ -809,6 +888,7 @@ export function allocationPage(state, metricsMap) {
                 <span class="num ${toneClass(cat.deviation)}">${sign}${fmtPct(cat.deviation)}</span>
               </div>
             </div>
+            ${rebalanceHtml(cat)}
             <div class="alloc-bar-wrap">
               <div class="alloc-bar-track">
                 <div class="alloc-bar-actual" style="width:${barActualWidth}%"></div>
@@ -881,7 +961,7 @@ export function allocationPage(state, metricsMap) {
     .map(
       (cat) => `
       <div class="cat-edit-row">
-        <input type="text" name="cat-name" value="${esc(cat.name)}" placeholder="类别名"
+        <input type="text" name="cat-name" value="${esc(cat.name)}" placeholder="类别名，如 指数型"
           data-old-name="${esc(cat.name)}">
         <input type="text" name="cat-target" value="${esc(String(cat.targetPct))}"
           inputmode="decimal" placeholder="目标 %">
@@ -917,6 +997,8 @@ export function allocationPage(state, metricsMap) {
         <p class="hero-note">${esc(heroStatus)}</p>
       </section>
 
+      ${hasData ? allocPieHtml(alloc) : ''}
+
       ${
         hasData && !hasConfig
           ? '<section class="empty-inline"><p>还没有配置分类，先添加一个类别和目标比例。</p></section>'
@@ -937,9 +1019,10 @@ export function allocationPage(state, metricsMap) {
         <form class="form" data-form="categories">
           <div class="cat-edit-list">${categoryEditorRows || '<p class="empty-inline">还没有类别，加一个吧。</p>'}</div>
           <div class="cat-edit-add">
+            <label class="field-label">新类别</label>
             <input type="text" name="newCatName" placeholder="类别名，如 指数型 / 行业主题 / 债券" autocomplete="off">
-            <input type="text" name="newCatTarget" placeholder="目标 %" inputmode="decimal" autocomplete="off">
-            <button class="btn ghost small" type="submit">＋ 添加</button>
+            <input type="text" name="newCatTarget" placeholder="目标%" inputmode="decimal" autocomplete="off" title="目标占比 %">
+            <button class="btn ghost small" type="submit" title="添加类别" aria-label="添加类别">＋</button>
           </div>
           <button class="btn primary block" type="submit">保存类别设置</button>
         </form>

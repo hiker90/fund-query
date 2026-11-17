@@ -1560,6 +1560,86 @@ a {
   color: var(--muted);
 }
 
+.rebal {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 9px;
+  margin-bottom: 10px;
+}
+
+.rebal.ok {
+  background: var(--ok-soft, rgba(52, 199, 89, 0.14));
+  color: var(--ok);
+}
+
+.rebal.buy {
+  background: var(--accent-soft, rgba(10, 108, 255, 0.14));
+  color: var(--accent);
+}
+
+.rebal.sell {
+  background: var(--danger-soft, rgba(224, 50, 42, 0.12));
+  color: var(--danger);
+}
+
+.pie-wrap {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.pie-chart-box {
+  flex: 0 0 150px;
+  width: 150px;
+  height: 150px;
+}
+
+.alloc-pie {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.alloc-pie circle {
+  stroke-linecap: butt;
+}
+
+.pie-legend {
+  flex: 1 1 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pie-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.pie-legend-item i {
+  width: 12px;
+  height: 12px;
+  border-radius: 4px;
+  flex: 0 0 12px;
+}
+
+.pie-legend-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+
 .alloc-bar-wrap {
   display: flex;
   flex-direction: column;
@@ -1671,42 +1751,102 @@ a {
 }
 
 .cat-edit-row input[type="text"] {
-  flex: 1;
-  padding: 8px 10px;
+  height: 40px;
+  padding: 0 12px;
   border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-size: 15px;
+  font-family: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.cat-edit-row input[type="text"]:focus,
+.cat-edit-add input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.cat-edit-row input[name="cat-name"] {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .cat-edit-row input[name="cat-target"] {
-  max-width: 100px;
+  flex: 0 0 44px;
+  padding: 0 8px;
   text-align: right;
+}
+
+.cat-edit-row .icon-btn {
+  flex: 0 0 36px;
+  height: 40px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.cat-edit-row .icon-btn:hover {
+  color: var(--danger);
+  border-color: var(--danger);
 }
 
 .cat-edit-add {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+
+.cat-edit-add .field-label {
+  width: 100%;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: -2px;
 }
 
 .cat-edit-add input[type="text"] {
-  flex: 1;
-  padding: 8px 10px;
+  height: 40px;
+  padding: 0 12px;
   border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--bg);
   color: var(--text);
-  font-size: 14px;
+  font-size: 15px;
+  font-family: inherit;
+  min-width: 0;
+}
+
+.cat-edit-add input[name="newCatName"] {
+  flex: 1 1 auto;
+  min-width: 96px;
 }
 
 .cat-edit-add input[name="newCatTarget"] {
-  max-width: 100px;
+  flex: 0 0 44px;
+  padding: 0 8px;
   text-align: right;
+}
+
+.cat-edit-add .btn {
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 10px;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .badge-ok {

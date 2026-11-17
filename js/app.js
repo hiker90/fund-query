@@ -158,7 +158,7 @@ function openAddFund() {
   showSheet({
     title: '添加监控基金',
     subtitle: '输入 6 位代码，可自动查询名称与净值',
-    body: views.addFundSheetBody(),
+    body: views.addFundSheetBody(state.categories || []),
     tall: true
   });
 }
@@ -194,6 +194,7 @@ function handleAddFund(form) {
   }
 
   const name = String(form.elements.name.value || '').trim() || `基金 ${code}`;
+  const category = String(form.elements.category?.value || '').trim();
   const enteredNav = num(form.elements.nav.value);
   const navDateInput = form.elements.navDate.value || todayISO();
   const buyDate = form.elements.buyDate.value || navDateInput;
@@ -252,6 +253,7 @@ function handleAddFund(form) {
     id: store.uid(),
     code,
     name,
+    category,
     nav,
     navDate: nav > 0 ? navDate : '',
     navUpdatedAt: nav > 0 ? Date.now() : 0,
