@@ -266,7 +266,7 @@ a {
 /* ---------- layout ---------- */
 
 .page {
-  padding: 4px 20px 24px;
+  padding: 12px 20px 24px;
 }
 
 .card {
@@ -512,6 +512,68 @@ a {
 .badge-accent {
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* 中性胶囊：无策略 / 估值正常 */
+.badge-flat {
+  color: var(--muted);
+  background: var(--fill);
+}
+
+/* 低估（绿，与低配/补仓同色系） */
+.badge-down {
+  color: var(--down);
+  background: var(--ok-soft);
+}
+
+/* 卡片标题行内小胶囊（估值水平） */
+.badge-mini {
+  margin-left: 6px;
+  padding: 3px 7px;
+  font-size: 10px;
+}
+
+/* 策略预置卡（普通 / 激进，只读展示） */
+.preset-card .preset-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.preset-card .preset-head b {
+  font-size: 15px;
+}
+
+.preset-card .preset-head small {
+  color: var(--muted);
+  margin-left: auto;
+  text-align: right;
+}
+
+.preset-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.preset-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 13px;
+}
+
+.preset-list li span {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.preset-list li b {
+  text-align: right;
 }
 
 .fund-nav {
@@ -1200,7 +1262,7 @@ a {
 .segmented {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 3px;
+  gap: 6px;
   padding: 3px;
   background: var(--fill);
   border-radius: 12px;
@@ -1238,7 +1300,7 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-top: -4px;
+  margin-top: 4px;
 }
 
 .lookup-status {
@@ -2136,6 +2198,86 @@ a {
   font-size: 12px;
   line-height: 1.6;
   color: var(--muted);
+}
+
+/* 一句话资产平衡方向（宏观指标卡片） */
+.macro-verdict {
+  margin-top: 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: var(--fill);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-2);
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.macro-verdict b {
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+/* 倾向色（宏观 verdict 与降级提示共用） */
+.t-ok { color: var(--ok); }
+.t-warn { color: var(--warn); }
+.t-danger { color: var(--danger); }
+.t-accent { color: var(--accent); }
+
+/* 资产方向速览（宏观页顶部） */
+.quick-dir-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.quick-dir-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.quick-dir-row:last-child {
+  border-bottom: none;
+  padding-bottom: 2px;
+}
+
+.quick-dir-row > b {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* 三资产再平衡（配置页，行样式复用自定义分类 alloc-row 体系） */
+.asset-fund-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.asset-fund-item > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.asset-fund-item select {
+  flex-shrink: 0;
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card-2);
+  color: var(--text-1);
 }
 
 .macro-loading {

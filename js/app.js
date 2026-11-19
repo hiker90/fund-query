@@ -1,14 +1,14 @@
 import * as store from './store.js';
 import {
   computeFundMetrics,
-  mergeStrategy,
-  normalizeTiers,
+  computeValuationLevel,
   num,
   parseBatchText,
+  resolveStrategyByKey,
   simulateAdd,
-  validateStrategy
+  STRATEGY_KEYS
 } from './strategy.js';
-import { fetchQuotes, isFundCode } from './quote.js';
+import { fetchQuotes, fetchValuationHistory, isFundCode } from './quote.js';
 import { fetchMacroData } from './macro.js';
 import * as views from './views.js';
 import {
@@ -27,7 +27,65 @@ let lastRouteKey = '';
 let macroData = null;
 let macroLoading = false;
 const expandedAllocCats = new Set();
+const expandedAssetClasses = new Set();
 let holdingsFilter = 'all';
+
+// 持仓页按需拉取：进入路由时自动拉一次，5 分钟内不重复（无定时器轮询）
+let lastAutoFetchAt = 0;
+const AUTO_FETCH_GAP_MS = 5 * 60 * 1000;
+
+// 估值水平缓存：基金代码 → { level, fetchedAt }，内存 30 分钟（禁止写入 localStorage）
+const valuationCache = new Map();
+const VALUATION_TTL_MS = 30 * 60 * 1000;
+let valuationLoading = false;
+
+function maybeAutoFetchHoldings() {
+  if (refreshing) return;
+  const now = Date.now();
+  if (lastAutoFetchAt !== 0 && now - lastAutoFetchAt < AUTO_FETCH_GAP_MS) return;
+  if (state.funds.length === 0) return; // 无基金时不触发，避免空提示
+  lastAutoFetchAt = now;
+  refreshFunds().catch(() => {});
+}
+
+async function loadValuations() {
+  if (valuationLoading) return;
+  const now = Date.now();
+  const targets = state.funds.filter((fund) => {
+    const cached = valuationCache.get(fund.code);
+    return !cached || now - cached.fetchedAt >= VALUATION_TTL_MS;
+  });
+  if (targets.length === 0) return;
+
+  valuationLoading = true;
+  try {
+    await Promise.all(
+      targets.map(async (fund) => {
+        const history = await fetchValuationHistory(fund.code); // 失败返回 null
+        valuationCache.set(fund.code, {
+          level: history ? computeValuationLevel(history) : null,
+          fetchedAt: Date.now()
+        });
+      })
+    );
+  } finally {
+    valuationLoading = false;
+  }
+  if (parseRoute().name === 'holdings') render(); // fetch 完成后更新估值标签
+}
+
+/** 基金代码 → 估值水平（仅返回已成功获取且未过期的） */
+function buildValuationMap() {
+  const map = new Map();
+  const now = Date.now();
+  for (const fund of state.funds) {
+    const cached = valuationCache.get(fund.code);
+    if (cached && cached.level && now - cached.fetchedAt < VALUATION_TTL_MS) {
+      map.set(fund.code, cached.level);
+    }
+  }
+  return map;
+}
 
 async function loadMacro({ force = false } = {}) {
   if (macroLoading) return;
@@ -94,7 +152,7 @@ function render() {
     app.innerHTML = views.strategyPage(state);
   } else if (route.name === 'allocation') {
     currentFundId = null;
-    app.innerHTML = views.allocationPage(state, buildMetricsMap(), expandedAllocCats);
+    app.innerHTML = views.allocationPage(state, buildMetricsMap(), expandedAllocCats, macroData, expandedAssetClasses);
   } else if (route.name === 'data') {
     currentFundId = null;
     app.innerHTML = views.dataPage(state);
@@ -108,7 +166,13 @@ function render() {
     }
   } else {
     currentFundId = null;
-    app.innerHTML = views.holdingsPage(state, buildMetricsMap(), { refreshing, filter: holdingsFilter });
+    app.innerHTML = views.holdingsPage(state, buildMetricsMap(), {
+      refreshing,
+      filter: holdingsFilter,
+      valuations: buildValuationMap()
+    });
+    maybeAutoFetchHoldings();
+    loadValuations().catch(() => {});
   }
 
   updateTabs(route);
@@ -126,7 +190,8 @@ function commit() {
 }
 
 function normalizeTierState(fund) {
-  const tiers = (state.settings.defaultStrategy.addTiers || []).length;
+  const strategy = resolveStrategyByKey(state.settings.defaultStrategy, fund.strategyOverride);
+  const tiers = (strategy && strategy.addTiers ? strategy.addTiers : []).length;
   const current = Array.isArray(fund.tierState) ? fund.tierState : [];
   fund.tierState = Array.from({ length: tiers }, (_, index) => Boolean(current[index]));
 }
@@ -263,13 +328,14 @@ async function confirmBatchImport() {
         code: row.code,
         name: (quote && quote.name) || `基金 ${row.code}`,
         category: '',
+        assetClass: 'EQUITY',
         nav,
         navDate: nav > 0 ? navDate : '',
         navUpdatedAt: nav > 0 ? Date.now() : 0,
         navHistory: nav > 0 ? [{ date: navDate, nav }] : [],
         strategyOverride: null,
         trades: [],
-        tierState: (state.settings.defaultStrategy.addTiers || []).map(() => false),
+        tierState: ((resolveStrategyByKey(state.settings.defaultStrategy, null) || {}).addTiers || []).map(() => false),
         logicIntact: true
       };
 
@@ -330,14 +396,6 @@ function openTrade(fundId, preset = {}) {
   });
 }
 
-function readTiers(container) {
-  if (!container) return [];
-  return [...container.querySelectorAll('.tier-row')].map((row) => ({
-    dropPct: num(row.querySelector('[name="tierDrop"]').value),
-    amount: num(row.querySelector('[name="tierAmount"]').value)
-  }));
-}
-
 function handleAddFund(form) {
   const code = String(form.elements.code.value || '').trim();
   if (!isFundCode(code)) {
@@ -351,6 +409,9 @@ function handleAddFund(form) {
 
   const name = String(form.elements.name.value || '').trim() || `基金 ${code}`;
   const category = String(form.elements.category?.value || '').trim();
+  const assetClass = ['EQUITY', 'BOND', 'GOLD'].includes(form.elements.assetClass?.value)
+    ? form.elements.assetClass.value
+    : 'EQUITY';
   const enteredNav = num(form.elements.nav.value);
   const navDateInput = form.elements.navDate.value || todayISO();
   const buyDate = form.elements.buyDate.value || navDateInput;
@@ -410,13 +471,14 @@ function handleAddFund(form) {
     code,
     name,
     category,
+    assetClass,
     nav,
     navDate: nav > 0 ? navDate : '',
     navUpdatedAt: nav > 0 ? Date.now() : 0,
     navHistory: nav > 0 ? [{ date: navDate || buyDate, nav }] : [],
     strategyOverride: null,
     trades: [],
-    tierState: (state.settings.defaultStrategy.addTiers || []).map(() => false),
+    tierState: ((resolveStrategyByKey(state.settings.defaultStrategy, null) || {}).addTiers || []).map(() => false),
     logicIntact: true
   };
 
@@ -446,64 +508,30 @@ function handleAddFund(form) {
 }
 
 function handleStrategy(form) {
-  const draft = {
-    stopLossPct: num(form.elements.stopLossPct.value),
-    takeProfitPct: num(form.elements.takeProfitPct.value),
-    takeProfitSellRatio: num(form.elements.takeProfitSellRatio.value),
-    trailingStopPct: num(form.elements.trailingStopPct.value),
-    reserveAmount: num(form.elements.reserveAmount.value),
-    reserveTriggerPct: num(form.elements.reserveTriggerPct.value),
-    addPositionSellPct: num(form.elements.addPositionSellPct.value),
-    addTiers: readTiers(form.querySelector('#strategy-tiers'))
-  };
-
-  const errors = validateStrategy(draft);
-  if (errors.length > 0) {
-    toast(errors[0], 'error');
+  const key = String(form.elements.defaultStrategy?.value || '');
+  if (!STRATEGY_KEYS.includes(key)) {
+    toast('请选择一个策略方案', 'error');
     return;
   }
 
-  state.settings.defaultStrategy = { ...draft, addTiers: normalizeTiers(draft.addTiers) };
+  state.settings.defaultStrategy = key;
   state.funds.forEach(normalizeTierState);
   commit();
-  toast('策略模板已保存', 'success');
+  toast(`默认策略已切换为「${key === 'AGGRESSIVE' ? '激进' : '普通'}」`, 'success');
 }
 
 function handleOverride(form) {
   const fund = getFund(form.dataset.fund);
   if (!fund) return;
 
-  const override = {};
-  ['stopLossPct', 'takeProfitPct', 'takeProfitSellRatio', 'trailingStopPct', 'addPositionSellPct', 'reserveAmount'].forEach(
-    (key) => {
-      const raw = String(form.elements[key].value || '').trim();
-      if (raw !== '' && Number.isFinite(Number(raw))) override[key] = Number(raw);
-    }
-  );
-
-  if (form.elements.enableTiers.checked) {
-    const tiers = normalizeTiers(readTiers(form.querySelector('#override-tiers')));
-    if (tiers.length === 0) {
-      toast('至少保留一个补仓档位', 'error');
-      return;
-    }
-    override.addTiers = tiers;
-  }
-
-  const effective = mergeStrategy(state.settings.defaultStrategy, override);
-  const errors = validateStrategy(effective);
-  if (errors.length > 0) {
-    toast(errors[0], 'error');
-    return;
-  }
-
-  fund.strategyOverride = Object.keys(override).length > 0 ? override : null;
-  const tierCount = effective.addTiers.length;
-  fund.tierState = Array.from({ length: tierCount }, (_, index) => Boolean((fund.tierState || [])[index]));
+  const raw = String(form.elements.strategyOverride?.value ?? '');
+  // ''（跟随全局）| 'NORMAL' | 'AGGRESSIVE' | 'NONE'
+  fund.strategyOverride = ['NORMAL', 'AGGRESSIVE', 'NONE'].includes(raw) ? raw : null;
+  normalizeTierState(fund);
   store.save(state);
   hideSheet();
   render();
-  toast('该基金的策略覆盖已保存', 'success');
+  toast('该基金的策略方案已保存', 'success');
 }
 
 function handleTrade(form) {
@@ -678,7 +706,7 @@ async function resetTiers(fundId) {
     confirmText: '重置'
   });
   if (!ok) return;
-  fund.tierState = (metricsFor(fund).strategy.addTiers || []).map(() => false);
+  fund.tierState = ((metricsFor(fund).strategy || {}).addTiers || []).map(() => false);
   commit();
   toast('档位已重置', 'success');
 }
@@ -774,6 +802,13 @@ document.addEventListener('click', (event) => {
     case 'batch-parse':
       handleBatchParse();
       break;
+    case 'batch-import-file': {
+      // 文件选择框自身的 click 冒泡到此委托时不再触发，避免递归
+      if (event.target.tagName === 'INPUT') break;
+      const fileInput = document.querySelector('input[data-action="batch-import-file"]');
+      if (fileInput) fileInput.click();
+      break;
+    }
     case 'batch-import-confirm':
       confirmBatchImport();
       break;
@@ -784,11 +819,26 @@ document.addEventListener('click', (event) => {
           if (parseRoute().name === 'macro') render();
         });
       break;
+    case 'alloc-tab':
+      // 配置页标签切换（三资产 / 自定义分类），UI 临时状态不持久化
+      views.setAllocTab(target.dataset.tab);
+      render();
+      break;
     case 'toggle-alloc': {
       const catName = target.closest('[data-category]')?.dataset.category;
       if (catName) {
         if (expandedAllocCats.has(catName)) expandedAllocCats.delete(catName);
         else expandedAllocCats.add(catName);
+        render();
+      }
+      break;
+    }
+    case 'toggle-asset': {
+      // 三资产行展开/折叠（基金明细 + 目标修改）
+      const clsKey = target.dataset.class;
+      if (clsKey) {
+        if (expandedAssetClasses.has(clsKey)) expandedAssetClasses.delete(clsKey);
+        else expandedAssetClasses.add(clsKey);
         render();
       }
       break;
@@ -850,23 +900,12 @@ document.addEventListener('click', (event) => {
       const fund = getFund(target.dataset.fund);
       if (fund) {
         showSheet({
-          title: '策略覆盖',
-          subtitle: '留空继承全局模板',
-          body: views.overrideSheetBody(fund, metricsFor(fund).strategy),
+          title: '策略方案',
+          subtitle: '该基金单独生效，优先于全局默认',
+          body: views.overrideSheetBody(fund, state.settings.defaultStrategy),
           tall: true
         });
       }
-      break;
-    }
-    case 'clear-override': {
-      const fund = getFund(target.dataset.fund);
-      if (!fund) break;
-      fund.strategyOverride = null;
-      normalizeTierState(fund);
-      store.save(state);
-      hideSheet();
-      render();
-      toast('已恢复跟随全局模板', 'success');
       break;
     }
     case 'reset-tiers':
@@ -878,26 +917,6 @@ document.addEventListener('click', (event) => {
     case 'delete-trade':
       deleteTrade(target.dataset.fund, target.dataset.trade);
       break;
-    case 'add-tier': {
-      const container = document.querySelector(target.dataset.target || '');
-      if (!container) break;
-      const rows = container.querySelectorAll('.tier-row');
-      const last = rows[rows.length - 1];
-      const lastDrop = last ? num(last.querySelector('[name="tierDrop"]').value) : 0;
-      const lastAmount = last ? num(last.querySelector('[name="tierAmount"]').value) : 0;
-      container.insertAdjacentHTML(
-        'beforeend',
-        views.tierRows([
-          { dropPct: lastDrop > 0 ? Math.min(lastDrop + 5, 95) : '', amount: lastAmount || '' }
-        ])
-      );
-      break;
-    }
-    case 'remove-tier': {
-      const row = target.closest('.tier-row');
-      if (row) row.remove();
-      break;
-    }
     case 'export':
       handleExport();
       break;
@@ -1088,10 +1107,49 @@ document.addEventListener('change', (event) => {
     return;
   }
 
+  // 修改基金资产大类（权益/债券/黄金）
+  const classSelect = event.target.closest('[data-action="change-fund-class"]');
+  if (classSelect) {
+    const fund = getFund(classSelect.dataset.fund);
+    const value = String(classSelect.value || '');
+    if (fund && ['EQUITY', 'BOND', 'GOLD'].includes(value)) {
+      fund.assetClass = value;
+      commit();
+      toast(`已将「${fund.name}」归入${value === 'EQUITY' ? '权益' : value === 'BOND' ? '债券' : '黄金'}大类`);
+    }
+    return;
+  }
+
   if (event.target.id === 'import-file') {
     handleImportFile(event.target);
+    return;
+  }
+
+  // 批量导入底仓：加载本地 CSV/TXT 文件到文本框并自动解析
+  if (event.target.dataset && event.target.dataset.action === 'batch-import-file') {
+    handleBatchImportFile(event.target);
   }
 });
+
+function handleBatchImportFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  input.value = ''; // 清空以便重复选择同一文件
+  if (file.size > 1024 * 1024) {
+    toast('文件过大（超过 1MB），请拆分后导入', 'error');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const form = document.querySelector('form[data-form="batch-import"]');
+    if (!form) return;
+    // 去除 Excel 导出 CSV 常见的 UTF-8 BOM
+    form.elements.payload.value = String(reader.result || '').replace(/^\uFEFF/, '').trim();
+    handleBatchParse();
+  };
+  reader.onerror = () => toast('文件读取失败', 'error');
+  reader.readAsText(file);
+}
 
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Enter' && event.key !== ' ') return;

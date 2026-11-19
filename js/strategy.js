@@ -1,32 +1,47 @@
 /**
- * 纯计算模块：持仓成本、策略规则线、分档补仓、移动止盈、补仓模拟。
+ * 纯计算模块：持仓成本、策略规则线、分档补仓、移动止盈、补仓模拟、估值水平。
  * 不依赖 DOM，可被浏览器与 Node 测试直接复用。
  */
 
-export const DEFAULT_STRATEGY = Object.freeze({
-  stopLossPct: 12,
-  takeProfitPct: 20,
-  takeProfitSellRatio: 40,
-  trailingStopPct: 8,
-  addTiers: [
-    { dropPct: 5, amount: 1200 },
-    { dropPct: 10, amount: 2000 },
-    { dropPct: 15, amount: 2800 }
-  ],
-  reserveAmount: 2400,
-  reserveTriggerPct: 20,
-  addPositionSellPct: 6
+/**
+ * 双预置策略方案（只读）：普通 / 激进。
+ * 策略不再支持自由编辑参数，仅允许选择预置与单基金覆盖。
+ */
+export const STRATEGY_PRESETS = Object.freeze({
+  NORMAL: Object.freeze({
+    stopLossPct: 12,
+    takeProfitPct: 20,
+    takeProfitSellRatio: 40,
+    trailingStopPct: 8,
+    addTiers: Object.freeze([
+      { dropPct: 5, amount: 1200 },
+      { dropPct: 10, amount: 2000 },
+      { dropPct: 15, amount: 2800 }
+    ]),
+    reserveAmount: 2400,
+    reserveTriggerPct: 20,
+    addPositionSellPct: 6
+  }),
+  AGGRESSIVE: Object.freeze({
+    stopLossPct: 8,
+    takeProfitPct: 25,
+    takeProfitSellRatio: 50,
+    trailingStopPct: 10,
+    addTiers: Object.freeze([
+      { dropPct: 4, amount: 1500 },
+      { dropPct: 8, amount: 2500 },
+      { dropPct: 12, amount: 3500 }
+    ]),
+    reserveAmount: 3000,
+    reserveTriggerPct: 15,
+    addPositionSellPct: 8
+  })
 });
 
-const NUMERIC_KEYS = [
-  'stopLossPct',
-  'takeProfitPct',
-  'takeProfitSellRatio',
-  'trailingStopPct',
-  'reserveAmount',
-  'reserveTriggerPct',
-  'addPositionSellPct'
-];
+export const STRATEGY_KEYS = Object.freeze(['NORMAL', 'AGGRESSIVE']);
+
+/** 兼容旧引用：默认策略 = 预置「普通」 */
+export const DEFAULT_STRATEGY = STRATEGY_PRESETS.NORMAL;
 
 const EPS = 1e-9;
 
@@ -35,35 +50,48 @@ export function num(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
-export function cloneStrategy(strategy = DEFAULT_STRATEGY) {
-  return {
-    ...strategy,
-    addTiers: (strategy.addTiers || []).map((tier) => ({ ...tier }))
-  };
-}
-
-export function normalizeTiers(tiers) {
-  return (Array.isArray(tiers) ? tiers : [])
-    .map((tier) => ({ dropPct: num(tier && tier.dropPct), amount: num(tier && tier.amount) }))
-    .filter((tier) => tier.dropPct > 0 && tier.amount >= 0)
-    .sort((a, b) => a.dropPct - b.dropPct);
-}
-
-export function mergeStrategy(base = DEFAULT_STRATEGY, override = null) {
-  const merged = cloneStrategy(base);
-  if (!override || typeof override !== 'object') return merged;
-  NUMERIC_KEYS.forEach((key) => {
-    const value = Number(override[key]);
-    if (Number.isFinite(value)) merged[key] = value;
-  });
-  if (Array.isArray(override.addTiers) && override.addTiers.length > 0) {
-    merged.addTiers = normalizeTiers(override.addTiers);
+/**
+ * 策略原始值 → 预置 key（数据迁移与解析共用）。
+ * - 字符串：'NONE' 保留（不启用），NORMAL/AGGRESSIVE 保留，其余非法 → 'NORMAL'
+ * - 旧对象型策略：stopLossPct ≤ 10 → 'AGGRESSIVE'，否则 'NORMAL'；字段缺失/非法 → 'NORMAL'
+ * - 空/缺失 → 'NORMAL'
+ */
+export function strategyKeyFromLegacy(raw) {
+  if (typeof raw === 'string') {
+    if (raw === 'NONE') return 'NONE';
+    return STRATEGY_KEYS.includes(raw) ? raw : 'NORMAL';
   }
-  return merged;
+  if (raw && typeof raw === 'object') {
+    const stopLoss = Number(raw.stopLossPct);
+    if (Number.isFinite(stopLoss) && stopLoss > 0) {
+      return stopLoss <= 10 ? 'AGGRESSIVE' : 'NORMAL';
+    }
+  }
+  return 'NORMAL';
 }
 
-export function resolveStrategy(defaultStrategy, fund) {
-  return mergeStrategy(defaultStrategy, fund && fund.strategyOverride);
+/**
+ * 策略解析唯一入口。
+ * @param {*} defaultKey 全局默认（'NORMAL'|'AGGRESSIVE'，兼容传入旧对象型）
+ * @param {*} fundStrategyKey 单基金覆盖（null/空=跟随全局 | 'NORMAL'|'AGGRESSIVE'|'NONE'）
+ * @returns null（NONE，不启用策略）或冻结的预置策略对象
+ */
+export function resolveStrategyByKey(defaultKey, fundStrategyKey) {
+  if (fundStrategyKey === 'NONE') return null;
+  const fundKey =
+    typeof fundStrategyKey === 'string' && STRATEGY_KEYS.includes(fundStrategyKey)
+      ? fundStrategyKey
+      : null;
+  const effectiveKey = fundKey || strategyKeyFromLegacy(defaultKey);
+  return STRATEGY_PRESETS[effectiveKey] || STRATEGY_PRESETS.NORMAL;
+}
+
+/** 本地日期 YYYY-MM-DD（纯函数，无 DOM 依赖） */
+export function todayISO() {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${now.getFullYear()}-${month}-${day}`;
 }
 
 /**
@@ -129,19 +157,37 @@ export function computePosition(trades = []) {
 }
 
 export function computeFundMetrics(fund, defaultStrategy) {
-  const strategy = resolveStrategy(defaultStrategy, fund);
+  const strategy = resolveStrategyByKey(defaultStrategy, fund && fund.strategyOverride);
   const position = computePosition(fund.trades);
   const nav = num(fund.nav);
   const avgCost = position.avgCost;
   const tierAnchor = position.baseCost > EPS ? position.baseCost : avgCost;
 
-  const marketValue = position.shares * nav;
+  // 当日买入的份额：成本与市值均按成交净值（trade.nav，即当日收盘净值）计算，
+  // 不参与当日涨跌（今日买入份额无昨日基准）。当日买入成本口径不变（amount = shares × nav）。
+  const todayIso = todayISO();
+  const sharesOfTrade = (trade) => {
+    const shares = num(trade.shares);
+    if (shares > EPS) return shares;
+    return num(trade.nav) > EPS ? num(trade.amount) / num(trade.nav) : 0;
+  };
+  const todayBuys = (fund.trades || []).filter(
+    (trade) => trade.type === 'BUY' && trade.date === todayIso
+  );
+  const todayShares = todayBuys.reduce((sum, trade) => sum + Math.max(sharesOfTrade(trade), 0), 0);
+  const todayNavValue = todayBuys.reduce(
+    (sum, trade) => sum + Math.max(sharesOfTrade(trade), 0) * num(trade.nav),
+    0
+  );
+  const settledShares = Math.max(position.shares - todayShares, 0);
+
+  const marketValue = settledShares * nav + todayNavValue;
   const holdingPnl = marketValue - position.cost;
   const holdingPnlPct = position.cost > EPS ? (holdingPnl / position.cost) * 100 : 0;
   const drawdownPct = avgCost > EPS && nav > 0 ? ((avgCost - nav) / avgCost) * 100 : 0;
 
-  const stopLossNav = avgCost > EPS ? avgCost * (1 - strategy.stopLossPct / 100) : 0;
-  const takeProfitNav = avgCost > EPS ? avgCost * (1 + strategy.takeProfitPct / 100) : 0;
+  const stopLossNav = strategy && avgCost > EPS ? avgCost * (1 - strategy.stopLossPct / 100) : 0;
+  const takeProfitNav = strategy && avgCost > EPS ? avgCost * (1 + strategy.takeProfitPct / 100) : 0;
 
   const history = Array.isArray(fund.navHistory) ? fund.navHistory : [];
   const peakNav = Math.max(
@@ -150,29 +196,36 @@ export function computeFundMetrics(fund, defaultStrategy) {
     ...(fund.trades || []).filter((t) => t.type !== 'SELL').map((t) => num(t.nav))
   );
 
-  const tiers = strategy.addTiers.map((tier, index) => ({
-    ...tier,
-    index,
-    executed: Boolean((fund.tierState || [])[index]),
-    triggerNav: tierAnchor > EPS ? tierAnchor * (1 - tier.dropPct / 100) : 0
-  }));
+  const tiers = strategy
+    ? strategy.addTiers.map((tier, index) => ({
+        ...tier,
+        index,
+        executed: Boolean((fund.tierState || [])[index]),
+        triggerNav: tierAnchor > EPS ? tierAnchor * (1 - tier.dropPct / 100) : 0
+      }))
+    : [];
 
   const triggeredTiers = tiers.filter(
     (tier) => !tier.executed && tierAnchor > EPS && nav > 0 && nav <= tier.triggerNav + EPS
   );
   const nextTier = tiers.find((tier) => !tier.executed && nav > tier.triggerNav) || null;
 
-  const stopLossHit = avgCost > EPS && nav > 0 && nav <= stopLossNav + EPS;
-  const takeProfitHit = avgCost > EPS && nav > 0 && nav >= takeProfitNav - EPS;
-  const trailingArmed = takeProfitNav > EPS && peakNav >= takeProfitNav - EPS;
-  const trailingStopNav = peakNav * (1 - strategy.trailingStopPct / 100);
+  const stopLossHit = Boolean(strategy) && avgCost > EPS && nav > 0 && nav <= stopLossNav + EPS;
+  const takeProfitHit = Boolean(strategy) && avgCost > EPS && nav > 0 && nav >= takeProfitNav - EPS;
+  const trailingArmed = Boolean(strategy) && takeProfitNav > EPS && peakNav >= takeProfitNav - EPS;
+  const trailingStopNav = strategy ? peakNav * (1 - strategy.trailingStopPct / 100) : 0;
   const trailingHit =
     !takeProfitHit && trailingArmed && nav > 0 && nav <= trailingStopNav + EPS;
   const nearStop =
-    !stopLossHit && avgCost > EPS && nav > 0 && nav <= stopLossNav * 1.02 + EPS;
+    Boolean(strategy) &&
+    !stopLossHit &&
+    avgCost > EPS &&
+    nav > 0 &&
+    nav <= stopLossNav * 1.02 + EPS;
 
   let status = 'normal';
-  if (stopLossHit) status = 'stop';
+  if (!strategy) status = 'none';
+  else if (stopLossHit) status = 'stop';
   else if (trailingHit) status = 'trailing';
   else if (takeProfitHit) status = 'takeProfit';
   else if (triggeredTiers.length > 0) status = 'add';
@@ -187,7 +240,7 @@ export function computeFundMetrics(fund, defaultStrategy) {
         ...trade,
         buyNav,
         returnPct,
-        suggestClose: returnPct >= strategy.addPositionSellPct
+        suggestClose: Boolean(strategy) && returnPct >= strategy.addPositionSellPct
       };
     });
 
@@ -255,8 +308,8 @@ export function simulateAdd(position, amount, nav, strategy) {
       valid: false,
       newShares: shares,
       newAvgCost: avgCost,
-      newStopLossNav: avgCost * (1 - strategy.stopLossPct / 100),
-      newTakeProfitNav: avgCost * (1 + strategy.takeProfitPct / 100),
+      newStopLossNav: strategy ? avgCost * (1 - strategy.stopLossPct / 100) : 0,
+      newTakeProfitNav: strategy ? avgCost * (1 + strategy.takeProfitPct / 100) : 0,
       costDropPct: 0,
       costChangePct: 0,
       breakevenPct: 0,
@@ -271,8 +324,8 @@ export function simulateAdd(position, amount, nav, strategy) {
     valid: true,
     newShares,
     newAvgCost,
-    newStopLossNav: newAvgCost * (1 - strategy.stopLossPct / 100),
-    newTakeProfitNav: newAvgCost * (1 + strategy.takeProfitPct / 100),
+    newStopLossNav: strategy ? newAvgCost * (1 - strategy.stopLossPct / 100) : 0,
+    newTakeProfitNav: strategy ? newAvgCost * (1 + strategy.takeProfitPct / 100) : 0,
     costDropPct: avgCost > EPS ? ((avgCost - newAvgCost) / avgCost) * 100 : 0,
     costChangePct: avgCost > EPS ? ((newAvgCost / avgCost - 1) * 100) : 0,
     breakevenPct: newAvgCost > EPS ? (newAvgCost / price - 1) * 100 : 0,
@@ -317,6 +370,41 @@ export function validateStrategy(draft) {
     });
   }
   return errors;
+}
+
+/**
+ * 估值水平：近一年单位净值分位。
+ * percentile = 净值数组中 ≤ 当前（最新）净值的样本数 / 样本总数 × 100
+ * - 当前（最新）净值 = 日期（YYYY-MM-DD）最大的一条；无日期时取数组末项
+ * - 元素支持 { date, nav } 对象（任意顺序）或纯数字
+ * - percentile ≤ 30 → { label: '低估', tone: 'down' }；30–70 → '正常'（'flat'）；≥ 70 → '高估'（'warn'）
+ * - 有效样本 < 20 条或输入为空 → null（界面不显示标签）
+ */
+export function computeValuationLevel(navList) {
+  const list = (Array.isArray(navList) ? navList : [])
+    .map((item) => {
+      if (item && typeof item === 'object') {
+        const date = typeof item.date === 'string' ? item.date : '';
+        return { date, nav: num(item.nav) };
+      }
+      return { date: '', nav: num(item) };
+    })
+    .filter((item) => item.nav > EPS);
+
+  if (list.length < 20) return null;
+
+  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+  const dated = list.filter((item) => dateRe.test(item.date));
+  const currentNav = dated.length
+    ? dated.reduce((latest, item) => (item.date > latest.date ? item : latest)).nav
+    : list[list.length - 1].nav;
+
+  const belowOrEqual = list.filter((item) => item.nav <= currentNav + EPS).length;
+  const percentile = (belowOrEqual / list.length) * 100;
+
+  if (percentile <= 30) return { percentile, label: '低估', tone: 'down' };
+  if (percentile >= 70) return { percentile, label: '高估', tone: 'warn' };
+  return { percentile, label: '正常', tone: 'flat' };
 }
 
 /**
@@ -407,6 +495,111 @@ export function computeAllocation(state, metricsMap) {
     uncategorizedFunds,
     uncategorizedValue,
     uncategorizedPct
+  };
+}
+
+/** 资产大类定义（权益 / 债券 / 黄金） */
+export const ASSET_CLASSES = Object.freeze([
+  { key: 'EQUITY', label: '权益' },
+  { key: 'BOND', label: '债券' },
+  { key: 'GOLD', label: '黄金' }
+]);
+
+export const DEFAULT_ASSET_TARGETS = Object.freeze({ equity: 60, bond: 30, gold: 10 });
+
+/**
+ * 三资产预置分配方案（宏观指标驱动自动切换）。
+ * 目标比例完全由 recommendAssetScheme 决定，不支持手动自定义。
+ */
+export const ASSET_SCHEMES = Object.freeze([
+  { key: 'aggressive', label: '进攻', targets: { equity: 70, bond: 20, gold: 10 } },
+  { key: 'balanced', label: '平衡', targets: { equity: 60, bond: 30, gold: 10 } },
+  { key: 'goldHedge', label: '偏金', targets: { equity: 55, bond: 25, gold: 20 } },
+  { key: 'defensive', label: '防守', targets: { equity: 40, bond: 40, gold: 20 } }
+]);
+
+/**
+ * 根据宏观指标推荐三资产方案（纯函数，规则与宏观页方向速览一致）。
+ * 优先级：美债曲线倒挂 / 股债分位低位 → 防守；分位高位 → 进攻；
+ * 实际利率 ≤0 → 偏金；其余 → 平衡。宏观数据缺失 → 平衡兜底。
+ */
+export function recommendAssetScheme(macro) {
+  const eb = macro && macro.equityBond;
+  const percentile = eb && Number.isFinite(eb.ratioPercentile) ? eb.ratioPercentile : null;
+  const usBp = macro && Number.isFinite(macro.usTermSpreadBp) ? macro.usTermSpreadBp : null;
+  const realRate = macro && Number.isFinite(macro.usRealRate) ? macro.usRealRate : null;
+  const pick = (scheme, reason) => ({ ...scheme, reason });
+  if (usBp !== null && usBp < 0) {
+    return pick(ASSET_SCHEMES[3], '美债收益率曲线倒挂，衰退风险上升，建议防守配置');
+  }
+  if (percentile !== null && percentile <= 30) {
+    return pick(ASSET_SCHEMES[3], `股债性价比分位低位（${Math.round(percentile)}%），债券相对更优，建议防守配置`);
+  }
+  if (percentile !== null && percentile >= 70) {
+    return pick(ASSET_SCHEMES[0], `股债性价比分位高位（${Math.round(percentile)}%），权益吸引力强，建议进攻配置`);
+  }
+  if (realRate !== null && realRate <= 0) {
+    return pick(ASSET_SCHEMES[2], '美国实际利率为负，黄金配置价值上升，建议偏金配置');
+  }
+  return pick(ASSET_SCHEMES[1], '宏观指标中性，维持均衡配置');
+}
+
+/**
+ * 三资产再平衡：按 fund.assetClass（EQUITY/BOND/GOLD）聚合市值，
+ * 与 settings.assetTargets 目标比例比较，输出实际占比、偏差与调仓金额。
+ * 口径与 computeAllocation 一致：无持仓（shares=0 / 市值≤0）的基金不计入。
+ * assetTargets 缺失/非法时回退默认值 { equity:60, bond:30, gold:10 }。
+ */
+export function computeThreeAssetAllocation(state, metricsMap) {
+  const funds = state.funds || [];
+  const rawTargets = (state.settings && state.settings.assetTargets) || {};
+  const targets = {};
+  for (const cls of ASSET_CLASSES) {
+    const key = cls.key.toLowerCase();
+    const value = Number(rawTargets[key]);
+    targets[cls.key] = Number.isFinite(value) ? Math.min(100, Math.max(0, value)) : DEFAULT_ASSET_TARGETS[key];
+  }
+
+  const byClass = new Map(ASSET_CLASSES.map((cls) => [cls.key, []]));
+  let totalMarketValue = 0;
+
+  for (const fund of funds) {
+    const metrics = metricsMap.get(fund.id);
+    if (!metrics) continue;
+    const mv = metrics.marketValue;
+    if (metrics.position.shares <= EPS || mv <= EPS) continue;
+    totalMarketValue += mv;
+    const cls = ASSET_CLASSES.some((c) => c.key === fund.assetClass) ? fund.assetClass : 'EQUITY';
+    byClass.get(cls).push({ fund, marketValue: mv });
+  }
+
+  const classes = ASSET_CLASSES.map((cls) => {
+    const items = byClass.get(cls.key);
+    const actualValue = items.reduce((sum, item) => sum + item.marketValue, 0);
+    const actualPct = totalMarketValue > EPS ? (actualValue / totalMarketValue) * 100 : 0;
+    const targetPct = targets[cls.key];
+    const deviation = actualPct - targetPct; // 正=超配，负=低配
+    const targetValue = (targetPct / 100) * totalMarketValue;
+    return {
+      key: cls.key,
+      label: cls.label,
+      targetPct,
+      actualValue,
+      actualPct,
+      deviation,
+      adjustAmount: targetValue - actualValue, // 正=需买入，负=需卖出
+      fundCount: items.length,
+      funds: items
+    };
+  });
+
+  const targetTotal = Object.values(targets).reduce((sum, v) => sum + v, 0);
+
+  return {
+    totalMarketValue,
+    classes,
+    targetTotal,
+    targetTotalOk: Math.abs(targetTotal - 100) < 0.01
   };
 }
 

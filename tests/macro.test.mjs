@@ -52,5 +52,48 @@ function assert(name, cond, detail = '') {
   assert('序列太短返回 null', computeEquityBond([{ date: 'a', close: 1 }], new Map([['a', 2]]), 10, 100) === null);
 }
 
+import { computeSpreadBp, computeOilYoy, computeRealRate } from '../js/macro.js';
+
+// computeSpreadBp 期限利差
+{
+  assert('利差：10Y−5Y = 0.5% → 50bp', computeSpreadBp(2.0, 1.5) === 50);
+  assert('利差：倒挂 → 负 bp', Math.abs(computeSpreadBp(1.2, 1.5) - -30) < 1e-9);
+  assert('利差：短端缺失返回 null', computeSpreadBp(2.0, NaN) === null);
+  assert('利差：长端缺失返回 null', computeSpreadBp(undefined, 1.5) === null);
+}
+
+// computeOilYoy WTI 同比
+{
+  // 构造 366 天日频序列：一年前 80 元，当前 100 元 → 同比 +25%
+  const series = [];
+  for (let i = 0; i < 400; i += 1) {
+    const date = new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString().slice(0, 10);
+    series.push({ date, close: i < 35 ? 80 : 100 });
+  }
+  const yoy = computeOilYoy(series);
+  assert('WTI 同比：正收益约 +25%', yoy !== null && Math.abs(yoy - 25) < 1e-6, `got ${yoy}`);
+
+  // 一年前 100 元，当前 80 元 → 同比 −20%
+  const falling = series.map((p, i) => ({ date: p.date, close: i < 35 ? 100 : 80 }));
+  const yoy2 = computeOilYoy(falling);
+  assert('WTI 同比：负收益约 −20%', Math.abs(yoy2 - -20) < 1e-6, `got ${yoy2}`);
+
+  // 边界：样本不足 / 非法收盘价
+  assert('WTI 同比：样本不足返回 null', computeOilYoy(series.slice(0, 200)) === null);
+  assert('WTI 同比：空序列返回 null', computeOilYoy([]) === null);
+  // 非法收盘价点被过滤：剩余有效样本仍足够时正常计算
+  const withStray = series.map((p, i) => (i === 30 ? { ...p, close: 0 } : p));
+  const yoy3 = computeOilYoy(withStray);
+  assert('WTI 同比：非法点被过滤后正常计算', Math.abs(yoy3 - 25) < 1e-6, `got ${yoy3}`);
+}
+
+// computeRealRate 美国实际利率（近似）
+{
+  assert('实际利率：4.5 − 2.5 = 2%', computeRealRate(4.5, 2.5) === 2);
+  assert('实际利率：通胀高于名义 → 负值', Math.abs(computeRealRate(3.0, 5.5) - -2.5) < 1e-9);
+  assert('实际利率：油价数据缺失返回 null', computeRealRate(4.5, null) === null);
+  assert('实际利率：收益率缺失返回 null', computeRealRate(NaN, 2.5) === null);
+}
+
 console.log(`\n${passed} 通过，${failed} 失败`);
 if (failed > 0) process.exit(1);

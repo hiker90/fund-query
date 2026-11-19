@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, parseBatchText } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -17,7 +17,8 @@ const STATUS_META = {
   add: { label: '可补仓', tone: 'accent', rank: 3 },
   takeProfit: { label: '触发止盈', tone: 'accent', rank: 2 },
   trailing: { label: '移动止盈', tone: 'warn', rank: 1 },
-  stop: { label: '触发止损', tone: 'danger', rank: 0 }
+  stop: { label: '触发止损', tone: 'danger', rank: 0 },
+  none: { label: '无策略', tone: 'flat', rank: 6 }
 };
 
 export function statusMeta(status) {
@@ -45,6 +46,13 @@ function badge(metrics) {
   return `<span class="badge badge-${meta.tone}">${esc(meta.label)}</span>`;
 }
 
+/** 估值水平小胶囊：如「估值 78%·高估」；无数据显示则不出 */
+function valuationBadge(valuation) {
+  if (!valuation || !valuation.label) return '';
+  const pct = Math.round(num(valuation.percentile));
+  return `<span class="badge badge-${valuation.tone || 'flat'} badge-mini">估值 ${pct}%·${esc(valuation.label)}</span>`;
+}
+
 function navMarkerPosition(metrics) {
   if (!metrics.avgCost || !metrics.nav) return 50;
   const low = metrics.stopLossNav * 0.98;
@@ -54,7 +62,7 @@ function navMarkerPosition(metrics) {
 }
 
 function ruleTrack(metrics) {
-  if (!metrics.avgCost) return '';
+  if (!metrics.avgCost || !metrics.strategy) return '';
   const position = navMarkerPosition(metrics);
   return `
     <div class="rule-track" aria-hidden="true">
@@ -73,6 +81,7 @@ function ruleTrack(metrics) {
 
 function nextTierHint(metrics) {
   if (!metrics.avgCost) return '尚未录入持仓，先在详情页登记一笔买入';
+  if (!metrics.strategy) return '该基金未启用策略，仅记录持仓成本与收益';
   if (metrics.triggeredTiers.length > 0) {
     const indexes = metrics.triggeredTiers.map((tier) => `第 ${tier.index + 1} 档`).join('、');
     const total = metrics.triggeredTiers.reduce((sum, tier) => sum + tier.amount, 0);
@@ -84,7 +93,7 @@ function nextTierHint(metrics) {
   return '所有补仓档位均已执行，保留最终储备';
 }
 
-function fundCard(metrics) {
+function fundCard(metrics, valuation = null) {
   const { fund } = metrics;
   const hasPosition = metrics.avgCost > 0;
   const pnlPct = hasPosition ? metrics.holdingPnlPct : 0;
@@ -94,6 +103,7 @@ function fundCard(metrics) {
         <div class="fund-title">
           <h3>${esc(fund.name || fund.code)}</h3>
           <span class="fund-code">${esc(fund.code)}</span>
+          ${valuationBadge(valuation)}
         </div>
         ${badge(metrics)}
       </div>
@@ -137,7 +147,7 @@ function emptyState() {
     </div>`;
 }
 
-export function holdingsPage(state, metricsMap, { refreshing = false, filter = 'all' } = {}) {
+export function holdingsPage(state, metricsMap, { refreshing = false, filter = 'all', valuations = null } = {}) {
   const metricsList = state.funds
     .map((fund) => metricsMap.get(fund.id))
     .filter(Boolean)
@@ -213,7 +223,9 @@ export function holdingsPage(state, metricsMap, { refreshing = false, filter = '
       ${filterBar}
       ${
         filteredList.length
-          ? `<section class="fund-list">${filteredList.map(fundCard).join('')}</section>`
+          ? `<section class="fund-list">${filteredList
+              .map((metrics) => fundCard(metrics, valuations && valuations.get(metrics.fund.code)))
+              .join('')}</section>`
           : metricsList.length
             ? `<div class="empty-state compact"><p>「${esc(activeFilter.label)}」状态下暂无基金</p></div>`
             : emptyState()
@@ -233,7 +245,7 @@ function ladderRow(label, value, extra, kind) {
 }
 
 function ruleLadder(metrics) {
-  if (!metrics.avgCost) return '';
+  if (!metrics.avgCost || !metrics.strategy) return '';
   const nav = metrics.nav;
   const rows = [
     {
@@ -281,6 +293,7 @@ function ruleLadder(metrics) {
 
 function tiersCard(metrics) {
   const { fund, strategy } = metrics;
+  if (!strategy) return '';
   return `
     <section class="card">
       <h2 class="card-title">分档补仓</h2>
@@ -323,7 +336,9 @@ function tiersCard(metrics) {
 }
 
 function simulatorCard(metrics) {
-  const defaultAmount = metrics.nextTier ? metrics.nextTier.amount : metrics.strategy.addTiers[0]?.amount || 1200;
+  const defaultAmount = metrics.nextTier
+    ? metrics.nextTier.amount
+    : (metrics.strategy && metrics.strategy.addTiers[0]?.amount) || 1200;
   const price = metrics.nav || metrics.avgCost;
   const result = simulateAdd(metrics.position, defaultAmount, price, metrics.strategy);
   return `
@@ -348,6 +363,9 @@ export function simResultHtml(result, strategy) {
   if (!result || !result.valid) {
     return '<p class="sim-empty">输入补仓金额与净值后显示结果</p>';
   }
+  const ratioNote = strategy
+    ? `；止损止盈已按新成本重算（-${strategy.stopLossPct}% / +${strategy.takeProfitPct}%）`
+    : '；该基金未启用策略，不计算规则线';
   return `
     <div class="sim-grid">
       <div><span>补仓后成本</span><b class="num">${fmtNav(result.newAvgCost)}</b></div>
@@ -355,7 +373,7 @@ export function simResultHtml(result, strategy) {
       <div><span>新止损线</span><b class="num">${fmtNav(result.newStopLossNav)}</b></div>
       <div><span>新止盈线</span><b class="num">${fmtNav(result.newTakeProfitNav)}</b></div>
     </div>
-    <p class="sim-note">补仓后回本需 ${fmtPct(result.breakevenPct)}；止损止盈已按新成本重算（-${strategy.stopLossPct}% / +${strategy.takeProfitPct}%）。</p>`;
+    <p class="sim-note">补仓后回本需 ${fmtPct(result.breakevenPct)}${ratioNote}。</p>`;
 }
 
 function addBatchesCard(metrics) {
@@ -379,7 +397,9 @@ function addBatchesCard(metrics) {
                 ? `<button class="btn small primary" type="button" data-action="close-batch"
                     data-fund="${esc(metrics.fund.id)}" data-trade="${esc(batch.id)}"
                     data-shares="${batch.shares}" data-amount="${batch.amount}">了结</button>`
-                : `<span class="muted small-text">目标 +${metrics.strategy.addPositionSellPct}%</span>`
+                : `<span class="muted small-text">${
+                    metrics.strategy ? `目标 +${metrics.strategy.addPositionSellPct}%` : '未启用策略'
+                  }</span>`
             }
           </div>`
           )
@@ -451,7 +471,7 @@ function manageCard(metrics) {
       </label>
       <div class="button-grid">
         <button class="btn ghost" type="button" data-action="manual-nav" data-fund="${esc(fund.id)}">手动录入净值</button>
-        <button class="btn ghost" type="button" data-action="override" data-fund="${esc(fund.id)}">策略覆盖</button>
+        <button class="btn ghost" type="button" data-action="override" data-fund="${esc(fund.id)}">策略方案</button>
         <button class="btn ghost" type="button" data-action="reset-tiers" data-fund="${esc(fund.id)}">重置补仓档位</button>
         <button class="btn ghost danger-text" type="button" data-action="delete-fund" data-fund="${esc(fund.id)}">删除基金</button>
       </div>
@@ -540,81 +560,66 @@ function field({
     </label>`;
 }
 
-export function tierRows(tiers) {
-  return (tiers || [])
-    .map(
-      (tier) => `
-      <div class="tier-row">
-        <label class="field">
-          <span>跌幅 %</span>
-          <input type="text" name="tierDrop" inputmode="decimal" value="${esc(tier.dropPct)}" autocomplete="off">
-        </label>
-        <label class="field">
-          <span>金额（元）</span>
-          <input type="text" name="tierAmount" inputmode="decimal" value="${esc(tier.amount)}" autocomplete="off">
-        </label>
-        <button class="icon-btn small" type="button" data-action="remove-tier" aria-label="删除该档">✕</button>
-      </div>`
-    )
-    .join('');
-}
-
 export function strategyPage(state) {
-  const strategy = state.settings.defaultStrategy;
+  const currentKey = state.settings.defaultStrategy === 'AGGRESSIVE' ? 'AGGRESSIVE' : 'NORMAL';
+  const presetCards = Object.keys(STRATEGY_PRESETS)
+    .map((key) => presetCard(key, currentKey === key))
+    .join('');
   return `
     <header class="topbar">
       <div class="topbar-row">
         <div>
-          <p class="eyebrow">全局模板</p>
+          <p class="eyebrow">策略方案</p>
           <h1>交易策略</h1>
         </div>
       </div>
     </header>
     <main class="page">
       <form class="form" data-form="strategy">
-        <section class="card">
-          <h2 class="card-title">止盈止损</h2>
-          <p class="card-sub">止损与止盈以平均成本为锚，分档补仓以底仓成本为锚</p>
-          <div class="field-grid">
-            ${field({ label: '止损比例（%）', name: 'stopLossPct', value: strategy.stopLossPct })}
-            ${field({ label: '止盈比例（%）', name: 'takeProfitPct', value: strategy.takeProfitPct })}
-            ${field({ label: '第一层止盈卖出（%）', name: 'takeProfitSellRatio', value: strategy.takeProfitSellRatio })}
-            ${field({ label: '移动止盈回撤（%）', name: 'trailingStopPct', value: strategy.trailingStopPct })}
-          </div>
-          <p class="hint-line">达到止盈线先卖出 ${strategy.takeProfitSellRatio}%，剩余仓位按最高浮盈回撤 ${strategy.trailingStopPct}% 移动止盈。</p>
-        </section>
-
-        <section class="card">
-          <h2 class="card-title">分档补仓</h2>
-          <p class="card-sub">跌幅按档递增，金额逐档放大，保留最终储备</p>
-          <div class="tier-editor" id="strategy-tiers">${tierRows(strategy.addTiers)}</div>
-          <button class="btn ghost small" type="button" data-action="add-tier" data-target="#strategy-tiers">＋ 添加档位</button>
-        </section>
-
-        <section class="card">
-          <h2 class="card-title">资金与了结</h2>
-          <div class="field-grid">
-            ${field({ label: '最终储备（元）', name: 'reserveAmount', value: strategy.reserveAmount })}
-            ${field({ label: '储备启用跌幅（%）', name: 'reserveTriggerPct', value: strategy.reserveTriggerPct })}
-            ${field({ label: '补仓独立了结收益（%）', name: 'addPositionSellPct', value: strategy.addPositionSellPct })}
-          </div>
-          <p class="hint-line">储备金不自动触发，仅在深度回撤时人工决定；补仓份额达到目标收益可优先单独卖出。</p>
-        </section>
-
-        <button class="btn primary block" type="submit">保存策略模板</button>
+        <p class="page-desc">选择全局默认策略，所有未单独覆盖的基金使用该方案。</p>
+        ${presetCards}
+        <button class="btn primary block" type="submit">保存默认方案</button>
       </form>
 
       <section class="card notes">
         <h2 class="card-title">策略说明</h2>
         <ul class="notes-list">
+          <li><b>预置不可改：</b>普通 / 激进两套参数为只读预置；单只基金可在详情页选择「跟随全局 / 普通 / 激进 / 不启用」。</li>
+          <li><b>不启用的含义：</b>选择「不启用」后该基金不再计算止损 / 止盈 / 分档提醒，仅记录成本与收益。</li>
           <li><b>先判断该不该补：</b>基金经理变更、策略漂移、规模接近清盘或指数规则重大调整时，不动用补仓资金。</li>
-          <li><b>分档而不是频繁小补：</b>每 5% 一档，金额递增，避免资金堆在半山腰。</li>
           <li><b>补仓后必须换锚：</b>止损线与止盈线按新的平均成本重算，而不是继续套用首次买入价。</li>
           <li><b>移动止盈只跟最高点：</b>回撤阈值不随成本变化，但仓位变重后绝对盈亏会放大。</li>
           <li><b>补仓可独立了结：</b>低位筹码反弹达标后先卖出，回收资金回到储备池。</li>
         </ul>
       </section>
     </main>`;
+}
+
+/** 单张只读预置卡：普通 / 激进，radio 选择作为全局默认 */
+function presetCard(key, isCurrent) {
+  const preset = STRATEGY_PRESETS[key];
+  if (!preset) return '';
+  const label = key === 'AGGRESSIVE' ? '激进' : '普通';
+  const desc = key === 'AGGRESSIVE' ? '止损更窄、止盈更高、补仓更早' : '节奏均衡，适合多数场景';
+  const tiersText = preset.addTiers
+    .map((tier) => `跌 ${tier.dropPct}% 补 ${fmtMoney(tier.amount, 0)} 元`)
+    .join('、');
+  return `
+    <section class="card preset-card">
+      <label class="preset-head">
+        <input type="radio" name="defaultStrategy" value="${key}" ${isCurrent ? 'checked' : ''}>
+        <b>${label}方案</b>
+        ${isCurrent ? '<span class="badge badge-accent">当前默认</span>' : ''}
+        <small>${esc(desc)}</small>
+      </label>
+      <ul class="preset-list">
+        <li><span>止损 / 止盈</span><b>-${preset.stopLossPct}% / +${preset.takeProfitPct}%</b></li>
+        <li><span>止盈卖出</span><b>达线先卖 ${preset.takeProfitSellRatio}%，峰值回撤 ${preset.trailingStopPct}% 清余仓</b></li>
+        <li><span>分档补仓</span><b>${esc(tiersText)}</b></li>
+        <li><span>最终储备</span><b>${fmtMoney(preset.reserveAmount, 0)} 元 · 跌超 ${preset.reserveTriggerPct}% 择机启用</b></li>
+        <li><span>补仓了结</span><b>批次收益 ≥ ${preset.addPositionSellPct}% 可单独卖出</b></li>
+      </ul>
+    </section>`;
 }
 
 export function dataPage(state) {
@@ -711,6 +716,60 @@ function macroPageHead(refreshing) {
     </header>`;
 }
 
+// —— 资产方向速览推导（宏观页顶部 + 配置页三资产标签共用）——
+export function computeQuickDirections(data) {
+  const dirs = [];
+  if (!data) return dirs;
+  // 权益：股债性价比分位为主，美债曲线倒挂为防守信号
+  const eb = data.equityBond;
+  const usBp = data.usTermSpreadBp;
+  if (!eb || !Number.isFinite(eb.ratioPercentile)) {
+    dirs.push({ label: '权益', tone: 'accent', text: '估值数据暂缺，建议按现有仓位观望。' });
+  } else if (eb.ratioPercentile >= 70 && !(Number.isFinite(usBp) && usBp < 0)) {
+    dirs.push({ label: '权益', tone: 'ok', text: `股债性价比分位高位（${Math.round(eb.ratioPercentile)}%），权益相对吸引力强，宜维持或增配。` });
+  } else if (eb.ratioPercentile <= 30) {
+    dirs.push({ label: '权益', tone: 'warn', text: `股债性价比分位低位（${Math.round(eb.ratioPercentile)}%），债券相对更优，宜控制权益仓位。` });
+  } else if (Number.isFinite(usBp) && usBp < 0) {
+    dirs.push({ label: '权益', tone: 'warn', text: '美债收益率曲线倒挂，衰退风险上升，权益宜防守为主。' });
+  } else {
+    dirs.push({ label: '权益', tone: 'accent', text: '股债性价比中性，权益维持现有配置。' });
+  }
+  // 债券：国债期限利差（宽松预期 vs 修复预期）
+  const cnBp = data.cnTermSpreadBp;
+  if (!Number.isFinite(cnBp)) {
+    dirs.push({ label: '债券', tone: 'accent', text: '国债数据暂缺，建议维持现有久期。' });
+  } else if (cnBp <= 30) {
+    dirs.push({ label: '债券', tone: 'ok', text: '国债曲线平坦，宽松预期主导，债市偏友好，宜增配。' });
+  } else if (cnBp >= 60) {
+    dirs.push({ label: '债券', tone: 'warn', text: '国债曲线陡峭化，经济修复预期升温，宜控制债券久期。' });
+  } else {
+    dirs.push({ label: '债券', tone: 'accent', text: '国债期限利差常规区间，债券维持现有配置。' });
+  }
+  // 黄金：美国实际利率（近似口径）
+  const rate = data.usRealRate;
+  if (!Number.isFinite(rate)) {
+    dirs.push({ label: '黄金', tone: 'accent', text: '实际利率数据暂缺，建议按现有比例持有。' });
+  } else if (rate <= 0) {
+    dirs.push({ label: '黄金', tone: 'ok', text: '实际利率为负，持有黄金机会成本低，宜增配。' });
+  } else if (rate >= 2) {
+    dirs.push({ label: '黄金', tone: 'warn', text: '实际利率偏高，黄金机会成本大，宜减配。' });
+  } else {
+    dirs.push({ label: '黄金', tone: 'accent', text: '实际利率中性，黄金维持现有配置。' });
+  }
+  // 石油：WTI 同比位置
+  const yoy = data.oilYoyPct;
+  if (!Number.isFinite(yoy)) {
+    dirs.push({ label: '石油', tone: 'accent', text: '油价同比数据暂缺，建议观望。' });
+  } else if (yoy >= 30) {
+    dirs.push({ label: '石油', tone: 'warn', text: '油价同比处于高位，注意回落风险，不宜追高。' });
+  } else if (yoy <= -20) {
+    dirs.push({ label: '石油', tone: 'ok', text: '油价同比处于低位，若供应端企稳存在修复机会，可少量关注。' });
+  } else {
+    dirs.push({ label: '石油', tone: 'accent', text: '油价处于常规区间，对配置方向无新增信号。' });
+  }
+  return dirs;
+}
+
 export function macroPage(data, { refreshing = false } = {}) {
   if (!data) {
     return `
@@ -728,64 +787,184 @@ export function macroPage(data, { refreshing = false } = {}) {
     const cls = item.changePct > 0 ? 'up' : 'down';
     return { text: `${item.changePct > 0 ? '+' : ''}${item.changePct.toFixed(2)}${unit}`, cls };
   };
+  const fmtBp = (bp) => (Number.isFinite(bp) ? `${bp > 0 ? '+' : ''}${Math.round(bp)} bp` : '—');
+  const bpCls = (bp) => (Number.isFinite(bp) ? (bp >= 0 ? 'up' : 'down') : '');
+  const fmtPctVal = (v) => (Number.isFinite(v) ? `${v.toFixed(2)}%` : '—');
 
-  // 1. 美债与美元
-  const us = chg(data.us10y, '%');
-  const dx = chg(data.dxy, '%');
-  const cardUs = `
-    <section class="card macro-card grad-blue">
-      <h2 class="card-title">美债与美元</h2>
-      ${macroMetricRow('美国10年期国债收益率', data.us10y.price > 0 ? `${data.us10y.price.toFixed(2)}%` : '—', us.text, us.cls)}
-      ${macroMetricRow('美元指数', data.dxy.price > 0 ? data.dxy.price.toFixed(2) : '—', dx.text, dx.cls)}
+  // —— 每张卡片一句话资产平衡方向（verdict）——
+  const equityBondVerdict = (eb) => {
+    if (!eb || !Number.isFinite(eb.ratioPercentile)) return null;
+    const p = eb.ratioPercentile;
+    if (p >= 70) return { tone: 'ok', text: '权益相对债券吸引力处于历史高位，宜增配权益、适当减配债券。' };
+    if (p <= 30) return { tone: 'warn', text: '股债性价比处于历史低位，债券更占优，宜增配债券、控制权益仓位。' };
+    return { tone: 'accent', text: '股债性价比处于中性区间，维持现有股债比例即可。' };
+  };
+  const realRateVerdict = (rate) => {
+    if (!Number.isFinite(rate)) return null;
+    if (rate >= 2) return { tone: 'warn', text: '实际利率偏高，持有黄金的机会成本大，宜减配黄金、增配债券。' };
+    if (rate <= 0) return { tone: 'ok', text: '实际利率为负，黄金配置价值上升，宜增配黄金、适当减配债券。' };
+    return { tone: 'accent', text: '实际利率处于中性区间，黄金与债券维持现有比例即可。' };
+  };
+  const usSpreadVerdict = (bp) => {
+    if (!Number.isFinite(bp)) return null;
+    if (bp < 0) return { tone: 'danger', text: '美债收益率曲线倒挂，衰退风险上升，宜降低权益敞口、增配债券与黄金。' };
+    if (bp < 20) return { tone: 'warn', text: '美债曲线明显走平，警惕经济放缓，宜逐步控制权益仓位。' };
+    return { tone: 'ok', text: '美债曲线形态正常，权益环境尚可，维持现有配置。' };
+  };
+  const cnSpreadVerdict = (bp) => {
+    if (!Number.isFinite(bp)) return null;
+    if (bp >= 60) return { tone: 'warn', text: '国债曲线陡峭化，经济修复预期强，宜控制债券久期、增配权益。' };
+    if (bp <= 30) return { tone: 'ok', text: '国债曲线平坦，宽松预期占主导，债券偏友好，宜增配债券。' };
+    return { tone: 'accent', text: '国债期限利差处于常规区间，股债维持现有比例即可。' };
+  };
+  const dxyVerdict = (item) => {
+    if (!item || !Number.isFinite(item.changePct)) return null;
+    if (item.changePct >= 0.3) return { tone: 'warn', text: '美元短线走强，压制黄金与新兴市场权益，宜控制这两类敞口。' };
+    if (item.changePct <= -0.3) return { tone: 'ok', text: '美元短线走弱，利好黄金与新兴市场权益。' };
+    return { tone: 'accent', text: '美元指数平稳，对股金配置无新增方向信号。' };
+  };
+  const cnUsVerdict = (bp) => {
+    if (!Number.isFinite(bp)) return null;
+    return bp < 0
+      ? { tone: 'warn', text: '中美利差倒挂，跨境资金存在流出压力，权益资产风险偏好受限。' }
+      : { tone: 'ok', text: '中美利差为正，跨境资金环境友好，权益资产外部压力较小。' };
+  };
+
+  const quickDirCard = `
+    <section class="card">
+      <h2 class="card-title">资产方向速览</h2>
+      <p class="card-sub">基于下方宏观指标自动推导，仅供参考</p>
+      <div class="quick-dir-list">
+        ${computeQuickDirections(data).map((d) => `<div class="quick-dir-row"><b class="t-${d.tone}">${esc(d.label)}</b><span>${esc(d.text)}</span></div>`).join('')}
+      </div>
     </section>`;
 
-  // 2. 中国国债与利差
-  const cn = chg(data.cn10y, '%');
-  let spreadText = '—';
-  let spreadCls = '';
-  if (Number.isFinite(data.cnUsSpreadBp)) {
-    spreadText = `${data.cnUsSpreadBp > 0 ? '+' : ''}${Math.round(data.cnUsSpreadBp)} bp`;
-    spreadCls = data.cnUsSpreadBp >= 0 ? 'up' : 'down';
-  }
-  const cardCn = `
-    <section class="card macro-card grad-teal">
-      <h2 class="card-title">中国国债与利差</h2>
-      ${macroMetricRow('中国10年期国债收益率', data.cn10y.price > 0 ? `${data.cn10y.price.toFixed(2)}%` : '—', cn.text, cn.cls)}
-      ${macroMetricRow('中美10年期利差（参考）', spreadText, '', spreadCls)}
-      <p class="macro-note">中债企业债信用利差暂无免费公开数据源，以中美10年期国债利差作为跨境利差参考。</p>
+  const card = ({ grad, title, sub, rows, extra = '', v = null, note = '' }) => `
+    <section class="card macro-card ${grad}">
+      <h2 class="card-title">${esc(title)}</h2>
+      ${sub ? `<p class="card-sub">${esc(sub)}</p>` : ''}
+      ${rows.map((r) => macroMetricRow(r.label, r.value, r.change || '', r.cls || '')).join('')}
+      ${extra}
+      ${v ? `<p class="macro-verdict"><b class="t-${v.tone}">◆</b> ${esc(v.text)}</p>` : ''}
+      ${note ? `<p class="macro-note">${esc(note)}</p>` : ''}
     </section>`;
 
-  // 3. 股债性价比
+  // 1. 股债性价比（权益 vs 债券）
   const eb = data.equityBond;
-  let cardEb;
-  if (eb) {
-    cardEb = `
-    <section class="card macro-card grad-violet">
-      <h2 class="card-title">股债性价比（沪深300）</h2>
-      ${macroMetricRow('盈利收益率（1/PE）', `${eb.earningsYield.toFixed(2)}%`)}
-      ${macroMetricRow('PE-TTM', data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—')}
-      ${macroMetricRow('股债收益比', eb.ratio.toFixed(2))}
-      ${macroMetricRow('风险溢价 ERP', `${eb.erp >= 0 ? '+' : ''}${eb.erp.toFixed(2)}%`)}
-      ${percentileBarHtml(eb.ratioPercentile, '股债收益比 5 年分位')}
-      <p class="macro-note">分位基于近 5 年日频数据（样本 ${eb.sampleSize} 个），盈利收益率采用当前盈利近似估算。</p>
-    </section>`;
-  } else {
-    cardEb = `
-    <section class="card macro-card grad-violet">
-      <h2 class="card-title">股债性价比（沪深300）</h2>
-      <p class="muted">历史序列暂不可用，请稍后刷新重试。</p>
-    </section>`;
-  }
+  const cardEb = card({
+    grad: 'grad-violet',
+    title: '股债性价比 · 权益 vs 债券',
+    rows: eb
+      ? [
+          { label: 'PE-TTM（计算因子）', value: data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—' },
+          { label: '盈利收益率 = 1 ÷ PE-TTM', value: fmtPctVal(eb.earningsYield) },
+          { label: '股债收益比', value: eb.ratio.toFixed(2) },
+          { label: '风险溢价 ERP', value: `${eb.erp >= 0 ? '+' : ''}${eb.erp.toFixed(2)}%` }
+        ]
+      : [{ label: 'PE-TTM（计算因子）', value: data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—' }],
+    extra: eb ? percentileBarHtml(eb.ratioPercentile, '股债收益比 5 年分位') : '',
+    v: equityBondVerdict(eb),
+    note: eb
+      ? `盈利收益率 = 1 ÷ PE-TTM，采用当前盈利近似估算；分位基于近 5 年日频数据（样本 ${eb.sampleSize} 个）。`
+      : '历史序列暂不可用，请稍后刷新重试。'
+  });
 
-  // 4. 大宗商品
+  // 2. 美国实际利率（黄金 vs 债券）
+  const cardReal = card({
+    grad: 'grad-blue',
+    title: '美国实际利率 · 黄金 vs 债券',
+    rows: [
+      { label: '美国10年期国债收益率', value: fmtPctVal(data.us10y.price), change: chg(data.us10y, '%').text, cls: chg(data.us10y, '%').cls },
+      { label: 'WTI 同比（通胀近似）', value: fmtPctVal(data.oilYoyPct) },
+      { label: '实际利率（近似）', value: fmtPctVal(data.usRealRate) }
+    ],
+    v: realRateVerdict(data.usRealRate),
+    note: '实际利率 = US10Y − WTI同比。美国通胀预期无免费公开接口，以 WTI 同比近似，仅供参考。'
+  });
+
+  // 3. 美债期限利差（权益风险总敞口）
+  const cardUsSpread = card({
+    grad: 'grad-blue',
+    title: '美债期限利差 · 权益风险总敞口',
+    rows: [
+      { label: '美国10Y', value: fmtPctVal(data.us10y.price) },
+      { label: '美国5Y', value: fmtPctVal(data.us05y.price) },
+      { label: '10Y − 5Y 利差', value: fmtBp(data.usTermSpreadBp), cls: bpCls(data.usTermSpreadBp) }
+    ],
+    v: usSpreadVerdict(data.usTermSpreadBp),
+    note: '东财全球债市场无 2Y 品种，期限利差采用 10Y−5Y 口径。'
+  });
+
+  // 4. 中国国债期限利差（债券友好度）
+  const cardCnSpread = card({
+    grad: 'grad-teal',
+    title: '中国期限利差 · 债券友好度',
+    rows: [
+      { label: '中国10Y', value: fmtPctVal(data.cn10y.price), change: chg(data.cn10y, '%').text, cls: chg(data.cn10y, '%').cls },
+      { label: '中国5Y', value: fmtPctVal(data.cn05y.price) },
+      { label: '10Y − 5Y 利差', value: fmtBp(data.cnTermSpreadBp), cls: bpCls(data.cnTermSpreadBp) }
+    ],
+    v: cnSpreadVerdict(data.cnTermSpreadBp),
+    note: '东财全球债市场无 2Y 品种，期限利差采用 10Y−5Y 口径。'
+  });
+
+  // 5. 美元指数（黄金与新兴权益）
+  const dx = chg(data.dxy, '%');
+  const cardDxy = card({
+    grad: 'grad-gold',
+    title: '美元指数 · 黄金与新兴权益',
+    rows: [{ label: '美元指数', value: data.dxy.price > 0 ? data.dxy.price.toFixed(2) : '—', change: dx.text, cls: dx.cls }],
+    v: dxyVerdict(data.dxy),
+    note: '美元与黄金、新兴市场权益大体负相关；日涨跌仅作短线参考。'
+  });
+
+  // 6. 中美10Y利差（跨境资金）
+  const cardCnUs = card({
+    grad: 'grad-teal',
+    title: '中美利差 · 跨境资金',
+    rows: [
+      { label: '中国10Y', value: fmtPctVal(data.cn10y.price) },
+      { label: '美国10Y', value: fmtPctVal(data.us10y.price) },
+      { label: '中美10Y利差', value: fmtBp(data.cnUsSpreadBp), cls: bpCls(data.cnUsSpreadBp) }
+    ],
+    v: cnUsVerdict(data.cnUsSpreadBp),
+    note: '中债企业债信用利差暂无免费公开数据源，以中美10年期国债利差作为跨境利差参考。'
+  });
+
+  // 7. 黄金价格（方向沿用实际利率锚）
   const gd = chg(data.gold, '%');
+  const cardGold = card({
+    grad: 'grad-gold',
+    title: 'COMEX 黄金 · 避险与实际利率锚',
+    rows: [
+      { label: 'COMEX 黄金', value: data.gold.price > 0 ? `$${data.gold.price.toFixed(1)}` : '—', change: gd.text, cls: gd.cls },
+      { label: '美元指数', value: data.dxy.price > 0 ? data.dxy.price.toFixed(2) : '—' },
+      { label: '美国实际利率（近似）', value: fmtPctVal(data.usRealRate) }
+    ],
+    v: realRateVerdict(data.usRealRate),
+    note: '黄金与实际利率负相关、与美元大体反向；方向判断采用实际利率近似口径（详见实际利率卡）。'
+  });
+
+  // 8. 石油价格（WTI 同比位置）
   const ol = chg(data.oil, '%');
-  const cardCm = `
-    <section class="card macro-card grad-gold">
-      <h2 class="card-title">大宗商品</h2>
-      ${macroMetricRow('COMEX 黄金', data.gold.price > 0 ? `$${data.gold.price.toFixed(1)}` : '—', gd.text, gd.cls)}
-      ${macroMetricRow('NYMEX 原油', data.oil.price > 0 ? `$${data.oil.price.toFixed(2)}` : '—', ol.text, ol.cls)}
-    </section>`;
+  const oilYoy = data.oilYoyPct;
+  const oilVerdict = !Number.isFinite(oilYoy)
+    ? { tone: 'accent', text: '油价同比数据暂缺，建议观望。' }
+    : oilYoy >= 30
+      ? { tone: 'warn', text: `油价同比 +${oilYoy.toFixed(0)}% 处于高位，注意回落风险，不宜追高。` }
+      : oilYoy <= -20
+        ? { tone: 'ok', text: `油价同比 ${oilYoy.toFixed(0)}% 处于低位，若供应端企稳存在修复机会，可少量关注。` }
+        : { tone: 'accent', text: '油价处于常规区间，对配置方向无新增信号。' };
+  const cardOil = card({
+    grad: 'grad-gold',
+    title: 'NYMEX 原油 · 通胀与周期锚',
+    rows: [
+      { label: 'NYMEX 原油', value: data.oil.price > 0 ? `$${data.oil.price.toFixed(2)}` : '—', change: ol.text, cls: ol.cls },
+      { label: 'WTI 同比（365 天）', value: fmtPctVal(oilYoy) }
+    ],
+    v: oilVerdict,
+    note: 'WTI 同比是通胀预期的近似代理，同时用于实际利率的计算因子（详见实际利率卡）。'
+  });
 
   const updated = new Date(data.updatedAt).toLocaleString('zh-CN', {
     month: '2-digit',
@@ -794,13 +973,29 @@ export function macroPage(data, { refreshing = false } = {}) {
     minute: '2-digit'
   });
 
+  // 降级提示：数据源兜底生效时明确告知口径
+  const degradedNotes = [];
+  if (data.quotesFailed) degradedNotes.push('东财行情不可用，国债收益率与美元指数暂缺');
+  if (data.proxyUsed) degradedNotes.push('黄金/原油/沪深300 为天天基金估值代理，仅日涨跌可用');
+  if (data.peMissing) degradedNotes.push('沪深300 PE 暂不可用，股债性价比降级');
+  if (data.historyMissing) degradedNotes.push('历史序列暂不可用，分位/同比/实际利率降级');
+  const degradedHtml = degradedNotes.length
+    ? `<p class="macro-note t-warn">⚠ 降级模式：${esc(degradedNotes.join('；'))}。</p>`
+    : '';
+
   return `
     ${macroPageHead(refreshing)}
     <main class="page">
-      ${cardUs}
-      ${cardCn}
+      ${quickDirCard}
       ${cardEb}
-      ${cardCm}
+      ${cardReal}
+      ${cardUsSpread}
+      ${cardCnSpread}
+      ${cardDxy}
+      ${cardCnUs}
+      ${cardGold}
+      ${cardOil}
+      ${degradedHtml}
       <p class="footnote">数据来源：东方财富公开接口 · 更新于 ${esc(updated)} · 仅供参考，不构成投资建议。</p>
     </main>`;
 }
@@ -817,6 +1012,8 @@ export function batchImportSheetBody() {
       </label>
       <div class="lookup-row">
         <button class="btn ghost small" type="button" data-action="batch-parse">解析预览</button>
+        <button class="btn ghost small" type="button" data-action="batch-import-file">加载本地文件</button>
+        <input type="file" accept=".csv,.txt,text/csv,text/plain" data-action="batch-import-file" hidden />
         <span class="lookup-status" id="batch-parse-status"></span>
       </div>
       <div id="batch-preview"></div>
@@ -911,6 +1108,13 @@ export function addFundSheetBody(categories = []) {
         ${field({ label: '净值日期', name: 'navDate', value: today, type: 'date', inputmode: 'none' })}
       </div>
       ${catSelect}
+      <label class="field">
+        <span>资产大类</span>
+        <select name="assetClass">
+          ${ASSET_CLASSES.map((c) => `<option value="${c.key}"${c.key === 'EQUITY' ? ' selected' : ''}>${esc(c.label)}</option>`).join('')}
+        </select>
+        <small>权益 / 债券 / 黄金，用于「三资产再平衡」统计，默认权益</small>
+      </label>
 
       <h3 class="form-section">初始底仓（可跳过）</h3>
       <div class="segmented" data-toggle="base-mode">
@@ -996,37 +1200,32 @@ export function manualNavSheetBody(fund) {
     </form>`;
 }
 
-export function overrideSheetBody(fund, effective) {
-  const override = fund.strategyOverride || {};
-  const overrideValue = (key) => (override[key] === undefined ? '' : override[key]);
-  const placeholder = (key) => String(effective[key]);
-  const tiers = Array.isArray(override.addTiers) ? override.addTiers : effective.addTiers;
-  const tierOverrideEnabled = Array.isArray(override.addTiers);
+export function overrideSheetBody(fund, defaultKey) {
+  const current = typeof fund.strategyOverride === 'string' ? fund.strategyOverride : '';
+  const globalLabel = defaultKey === 'AGGRESSIVE' ? '激进' : '普通';
+  // 当前生效方案：覆盖为 NORMAL/AGGRESSIVE 时取覆盖值，NONE 不启用，其余跟随全局
+  const effKey = fund.strategyOverride === 'NORMAL' || fund.strategyOverride === 'AGGRESSIVE'
+    ? fund.strategyOverride
+    : defaultKey === 'AGGRESSIVE' ? 'AGGRESSIVE' : 'NORMAL';
+  const effectiveLabel = fund.strategyOverride === 'NONE' ? '不启用' : effKey === 'AGGRESSIVE' ? '激进' : '普通';
 
   return `
     <form class="form" data-form="override" data-fund="${esc(fund.id)}">
-      <p class="hint-line">留空表示继承全局模板。填写后将只覆盖该基金的对应参数。</p>
-      <div class="field-grid">
-        ${field({ label: '止损比例（%）', name: 'stopLossPct', value: overrideValue('stopLossPct'), placeholder: placeholder('stopLossPct') })}
-        ${field({ label: '止盈比例（%）', name: 'takeProfitPct', value: overrideValue('takeProfitPct'), placeholder: placeholder('takeProfitPct') })}
-        ${field({ label: '第一层止盈卖出（%）', name: 'takeProfitSellRatio', value: overrideValue('takeProfitSellRatio'), placeholder: placeholder('takeProfitSellRatio') })}
-        ${field({ label: '移动止盈回撤（%）', name: 'trailingStopPct', value: overrideValue('trailingStopPct'), placeholder: placeholder('trailingStopPct') })}
-        ${field({ label: '补仓独立了结收益（%）', name: 'addPositionSellPct', value: overrideValue('addPositionSellPct'), placeholder: placeholder('addPositionSellPct') })}
-        ${field({ label: '最终储备（元）', name: 'reserveAmount', value: overrideValue('reserveAmount'), placeholder: placeholder('reserveAmount') })}
-      </div>
-
-      <label class="switch-row">
-        <span>
-          <b>独立补仓档位</b>
-          <small>关闭时沿用全局模板的档位与金额</small>
-        </span>
-        <input type="checkbox" name="enableTiers" ${tierOverrideEnabled ? 'checked' : ''}>
-      </label>
-      <div class="tier-editor" id="override-tiers">${tierRows(tiers)}</div>
-      <button class="btn ghost small" type="button" data-action="add-tier" data-target="#override-tiers">＋ 添加档位</button>
-
-      <button class="btn primary block" type="submit">保存覆盖</button>
-      <button class="btn ghost block danger-text" type="button" data-action="clear-override" data-fund="${esc(fund.id)}">恢复跟随全局模板</button>
+      <section class="card">
+        <h2 class="card-title">策略方案</h2>
+        <p class="card-sub">当前生效：${esc(effectiveLabel)}${current ? '' : '（跟随全局）'}</p>
+        <label class="field">
+          <span>选择方案</span>
+          <select name="strategyOverride">
+            <option value="" ${current === '' ? 'selected' : ''}>跟随全局（${esc(globalLabel)}）</option>
+            <option value="NORMAL" ${current === 'NORMAL' ? 'selected' : ''}>普通</option>
+            <option value="AGGRESSIVE" ${current === 'AGGRESSIVE' ? 'selected' : ''}>激进</option>
+            <option value="NONE" ${current === 'NONE' ? 'selected' : ''}>不启用（仅记录成本）</option>
+          </select>
+        </label>
+        <p class="hint-line">「不启用」后该基金不再计算止损 / 止盈 / 分档提醒，也不参与预警排序。</p>
+      </section>
+      <button class="btn primary block" type="submit">保存</button>
     </form>`;
 }
 
@@ -1123,7 +1322,14 @@ function allocPieHtml(alloc) {
     </section>`;
 }
 
-export function allocationPage(state, metricsMap, expandedCats = new Set()) {
+// 配置页 UI 临时状态：当前标签（三资产 / 自定义分类），不持久化
+let allocTab = 'asset';
+
+export function setAllocTab(tab) {
+  allocTab = tab === 'category' ? 'category' : 'asset';
+}
+
+export function allocationPage(state, metricsMap, expandedCats = new Set(), macroData = null, expandedAssets = new Set()) {
   const alloc = computeAllocation(state, metricsMap);
   const targetTotalDeviation = Math.abs(alloc.configuredTargetTotal - 100);
   const targetTone =
@@ -1242,6 +1448,95 @@ export function allocationPage(state, metricsMap, expandedCats = new Set()) {
     )
     .join('');
 
+  // 三资产再平衡（权益 / 债券 / 黄金）+ 宏观方向建议 + 推荐方案自动切换
+  const macroHints = macroData
+    ? Object.fromEntries(
+        computeQuickDirections(macroData)
+          .filter((d) => ['权益', '债券', '黄金'].includes(d.label))
+          .map((d) => [d.label, d])
+      )
+    : null;
+  const rec = recommendAssetScheme(macroData);
+  // 三资产目标比例仅由预置推荐方案决定（宏观数据缺失时按「平衡」方案兜底），不支持手动自定义
+  const effectiveState = { ...state, settings: { ...state.settings, assetTargets: { ...rec.targets } } };
+  const three = computeThreeAssetAllocation(effectiveState, metricsMap);
+  const assetRows = three.classes
+    .map((cls) => {
+      const sign = cls.deviation > 0 ? '+' : '';
+      const isOpen = expandedAssets.has(cls.key);
+      const barTargetLeft = cls.targetPct; // 目标线位置 0~100
+      const barActualWidth = Math.min(cls.actualPct, 100);
+      const hint = macroHints && macroHints[cls.label]
+        ? `<p class="macro-note">宏观：<b class="t-${macroHints[cls.label].tone}">◆</b> ${esc(macroHints[cls.label].text)}</p>`
+        : '';
+      const fundsItems = cls.funds
+        .map(
+          (f) => `
+        <div class="asset-fund-item">
+          <span>${esc(fmtFundName(f.fund))}</span>
+          <b class="num">${fmtMoney(f.marketValue)}</b>
+          <select data-action="change-fund-class" data-fund="${esc(f.fund.id)}" aria-label="修改资产大类">
+            ${ASSET_CLASSES.map((c) => `<option value="${c.key}"${c.key === f.fund.assetClass ? ' selected' : ''}>${esc(c.label)}</option>`).join('')}
+          </select>
+        </div>`
+        )
+        .join('');
+      return `
+      <section class="alloc-row${isOpen ? ' is-open' : ''}" data-class="${esc(cls.key)}">
+        <div class="alloc-head" data-action="toggle-asset" data-class="${esc(cls.key)}"
+          role="button" tabindex="0" aria-expanded="${isOpen}">
+          <div class="alloc-head-left">
+            <b>${esc(cls.label)}</b>
+            <span class="muted">${cls.fundCount} 只</span>
+          </div>
+          <div class="alloc-head-right">
+            <span class="num">${fmtMoney(cls.actualValue)}</span>
+            <span class="num ${toneClass(cls.deviation)}">${sign}${fmtPct(cls.deviation)}</span>
+            <svg class="alloc-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 6l6 6-6 6" />
+            </svg>
+          </div>
+        </div>
+        ${rebalanceHtml(cls)}
+        <div class="alloc-bar-wrap">
+          <div class="alloc-bar-track">
+            <span class="alloc-bar-target" style="left:${barTargetLeft}%"></span>
+            <span class="alloc-bar-nav" style="left:${barActualWidth}%"></span>
+          </div>
+          <div class="alloc-bar-labels">
+            <span>实际 ${fmtPct(cls.actualPct, { signed: false })}</span>
+            <span class="target-label">目标 ${fmtPct(cls.targetPct, { signed: false })}</span>
+          </div>
+        </div>
+        <div class="alloc-funds"${isOpen ? '' : ' hidden'}>
+          ${fundsItems}
+        </div>
+        ${hint}
+      </section>`;
+    })
+    .join('');
+
+  const schemeBlock = `
+      <section class="card">
+        <h2 class="card-title">宏观推荐方案</h2>
+        <p class="card-sub">当前方案：<b class="t-accent">${esc(rec.label)}</b>（权益 ${rec.targets.equity}% / 债券 ${rec.targets.bond}% / 黄金 ${rec.targets.gold}%）</p>
+        ${
+          macroData
+            ? `<p class="macro-note"><b class="t-accent">◆</b> ${esc(rec.reason)}</p>
+      <p class="macro-note">三资产目标比例由推荐方案自动决定，宏观变化时自动切换；您只需维护每只基金的大类归属。</p>`
+            : '<p class="macro-note">宏观数据暂缺，当前按「平衡」方案兜底；进入「宏观」页加载数据后自动切换。</p>'
+        }
+      </section>`;
+
+  const threeAssetBlock = `
+      ${schemeBlock}
+      <section class="card">
+        <h2 class="card-title">三资产再平衡</h2>
+        <p class="card-sub">按权益 / 债券 / 黄金三个大类统计偏差与调仓金额；点击行展开基金明细。</p>
+        <div class="alloc-list">${assetRows}</div>
+        <p class="macro-note">目标合计 <b class="num ${three.targetTotalOk ? 'ok' : 'warn'}">${fmtPct(three.targetTotal, { signed: false })}</b>。大类归属可在展开的基金行内切换。</p>
+      </section>`;
+
   return `
     <header class="topbar">
       <div class="topbar-row">
@@ -1252,10 +1547,18 @@ export function allocationPage(state, metricsMap, expandedCats = new Set()) {
       </div>
     </header>
     <main class="page">
+      <div class="filter-tabs" role="tablist" aria-label="配置页标签">
+        <button class="filter-tab${allocTab === 'asset' ? ' is-active' : ''}" type="button" data-action="alloc-tab" data-tab="asset">三资产</button>
+        <button class="filter-tab${allocTab === 'category' ? ' is-active' : ''}" type="button" data-action="alloc-tab" data-tab="category">自定义分类</button>
+      </div>
+
       <section class="hero-card">
         <p class="hero-label">总资产市值</p>
         <strong class="hero-value num">¥ ${fmtMoney(alloc.totalMarketValue)}</strong>
-        <div class="hero-chips">
+        ${
+          allocTab === 'asset'
+            ? `<p class="hero-note">${esc(!hasData ? '先添加基金并登记底仓，配置页才会显示占比' : '✓ 底仓数据就绪')}</p>`
+            : `<div class="hero-chips">
           <div>
             <span>已配置目标合计</span>
             <b class="num ${targetTone}">${fmtPct(alloc.configuredTargetTotal, { signed: false })}</b>
@@ -1265,9 +1568,17 @@ export function allocationPage(state, metricsMap, expandedCats = new Set()) {
             <b class="num">${fmtPct(alloc.uncategorizedPct, { signed: false })}</b>
           </div>
         </div>
-        <p class="hero-note">${esc(heroStatus)}</p>
+        <p class="hero-note">${esc(heroStatus)}</p>`
+        }
       </section>
 
+      ${
+        allocTab === 'asset'
+          ? hasData
+            ? `${threeAssetBlock}
+      <p class="footnote">宏观方向建议来自「宏观」页指标推导，仅供参考；占比按当前市值计算，无持仓的基金不计入分母。</p>`
+            : '<p class="empty-inline">登记底仓后才能计算三资产再平衡。</p>'
+          : `
       ${hasData ? allocPieHtml(alloc) : ''}
 
       ${
@@ -1299,6 +1610,7 @@ export function allocationPage(state, metricsMap, expandedCats = new Set()) {
         </form>
       </section>
 
-      <p class="footnote">占比按当前市值计算；无持仓的基金不计入配置分母。</p>
+      <p class="footnote">占比按当前市值计算；无持仓的基金不计入配置分母。</p>`
+      }
     </main>`;
 }
