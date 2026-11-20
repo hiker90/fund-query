@@ -1,4 +1,4 @@
-const CACHE_NAME = 'fundpilot-v1.4.0';
+const CACHE_NAME = 'fundpilot-v1.5.0';
 const ASSETS = [
   './',
   './index.html',
@@ -7,6 +7,7 @@ const ASSETS = [
   './js/store.js',
   './js/strategy.js',
   './js/quote.js',
+  './js/macro.js',
   './js/views.js',
   './js/ui.js',
   './manifest.webmanifest',
