@@ -6,9 +6,12 @@ import {
   backtestStrategy,
   classifyAssetClass,
   computeFundMetrics,
+  computeMacroAdvice,
   computePosition,
   computeThreeAssetAllocation,
   computeValuationLevel,
+  fundAssetKind,
+  isOverseasFtype,
   recommendAssetScheme,
   resolveStrategyByKey,
   simulateAdd,
@@ -676,6 +679,85 @@ test('sparkline：首尾定色（涨 up / 跌 down / 平 flat）、脏数据过�
   assert.equal(dirty.dir, 'up'); // null/0/-1 被过滤，剩 5 个有效点
   const many = sparklineData(Array.from({ length: 80 }, (_, i) => 1 + i * 0.01));
   assert.equal(many.points.split(' ').length, 60); // 尾部 60 点
+});
+
+// ===== 海外识别与策略锁定（fundAssetKind / computeMacroAdvice） =====
+
+test('isOverseasFtype：海外/QDII → true；QDII 债基、空值、普通类型 → false', () => {
+  assert.equal(isOverseasFtype('指数型-海外股票'), true);
+  assert.equal(isOverseasFtype('QDII'), true);
+  assert.equal(isOverseasFtype('qdii-股票'), true);
+  assert.equal(isOverseasFtype('债券型-海外'), false); // QDII 债基归 BOND
+  assert.equal(isOverseasFtype(''), false);
+  assert.equal(isOverseasFtype(null), false);
+  assert.equal(isOverseasFtype('指数型-股票'), false);
+});
+
+test('fundAssetKind：BOND/GOLD 锁定；海外 ftype → OVERSEAS；ftype 债券兜底；空 → EQUITY', () => {
+  assert.equal(fundAssetKind({ assetClass: 'BOND', ftype: '指数型-股票' }), 'BOND');
+  assert.equal(fundAssetKind({ assetClass: 'GOLD', ftype: '' }), 'GOLD');
+  assert.equal(fundAssetKind({ assetClass: 'EQUITY', ftype: '指数型-海外股票' }), 'OVERSEAS');
+  assert.equal(fundAssetKind({ assetClass: 'EQUITY', ftype: '混合债券型二级' }), 'BOND');
+  assert.equal(fundAssetKind({ ftype: '' }), 'EQUITY');
+  assert.equal(fundAssetKind(null), 'EQUITY');
+});
+
+function lockedFund(assetClass, ftype, override = null) {
+  return {
+    id: 'f1',
+    code: '000001',
+    name: '测试',
+    assetClass,
+    ftype,
+    strategyOverride: override,
+    trades: [{ id: 't1', type: 'BUY', source: 'MANUAL', date: '2026-01-10', nav: 1.0, amount: 10000, fee: 0, shares: 10000 }]
+  };
+}
+
+test('computeFundMetrics：债券/黄金/海外基金策略强制锁定为 null（override 无效）', () => {
+  for (const [assetClass, ftype, kind] of [
+    ['BOND', '债券型-混合二级', 'BOND'],
+    ['GOLD', 'ETF联接-黄金', 'GOLD'],
+    ['EQUITY', '指数型-海外股票', 'OVERSEAS']
+  ]) {
+    const metrics = computeFundMetrics(lockedFund(assetClass, ftype, 'AGGRESSIVE'), 'NORMAL');
+    assert.equal(metrics.assetKind, kind, kind);
+    assert.equal(metrics.strategy, null, `${kind} 应无策略`);
+    assert.equal(metrics.status, 'none', `${kind} 状态应为 none`);
+    assert.equal(metrics.stopLossNav, 0);
+    assert.equal(metrics.tiers.length, 0);
+    assert.equal(metrics.nearStop, false);
+  }
+  // EQUITY 不受影响：跟随全局 NORMAL
+  const equity = computeFundMetrics(lockedFund('EQUITY', '指数型-股票'), 'NORMAL');
+  assert.equal(equity.assetKind, 'EQUITY');
+  assert.ok(equity.strategy);
+});
+
+test('computeMacroAdvice：BOND 三段（30/60 边界）+ 数据缺失 flat', () => {
+  assert.equal(computeMacroAdvice('EQUITY', {}), null);
+  assert.equal(computeMacroAdvice('BOND', null).tone, 'flat');
+  assert.equal(computeMacroAdvice('BOND', {}).tone, 'flat');
+  assert.equal(computeMacroAdvice('BOND', { cnTermSpreadBp: 20 }).tone, 'ok');
+  assert.equal(computeMacroAdvice('BOND', { cnTermSpreadBp: 30 }).tone, 'ok'); // 边界含 30
+  assert.equal(computeMacroAdvice('BOND', { cnTermSpreadBp: 45 }).tone, 'accent');
+  assert.equal(computeMacroAdvice('BOND', { cnTermSpreadBp: 60 }).tone, 'warn'); // 边界含 60
+  assert.equal(computeMacroAdvice('BOND', { cnTermSpreadBp: 75 }).tone, 'warn');
+});
+
+test('computeMacroAdvice：GOLD 0/2 边界；OVERSEAS 倒挂升级 warn；EQUITY null', () => {
+  assert.equal(computeMacroAdvice('GOLD', { usRealRate: 0 }).tone, 'ok');
+  assert.equal(computeMacroAdvice('GOLD', { usRealRate: 1 }).tone, 'accent');
+  assert.equal(computeMacroAdvice('GOLD', { usRealRate: 2 }).tone, 'warn');
+  assert.equal(computeMacroAdvice('GOLD', { usRealRate: NaN }).tone, 'flat');
+
+  const friendly = computeMacroAdvice('OVERSEAS', { usRealRate: -0.5, usTermSpreadBp: 40 });
+  assert.equal(friendly.tone, 'ok');
+  const inverted = computeMacroAdvice('OVERSEAS', { usRealRate: 1, usTermSpreadBp: -20 });
+  assert.equal(inverted.tone, 'warn'); // 中性被倒挂升级为 warn
+  assert.ok(inverted.text.includes('倒挂'));
+  const stressed = computeMacroAdvice('OVERSEAS', { usRealRate: 2.5, usTermSpreadBp: 30 });
+  assert.equal(stressed.tone, 'warn');
 });
 
 // ===== 估值水平 computeValuationLevel（通用序列分位 + 分级 + 债券取反） =====

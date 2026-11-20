@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, sparklineData, summarizeAttention } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, computeMacroAdvice, sparklineData, summarizeAttention } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -97,7 +97,13 @@ function attentionCardHtml(metricsList) {
     </section>`;
 }
 
+/** 锁定类基金的 badge 标签（替代「无策略」） */
+const ASSET_KIND_LABELS = { BOND: '债券', GOLD: '黄金', OVERSEAS: '海外' };
+
 function badge(metrics) {
+  // 债券/黄金/海外权益基金不适用分档策略 → 显示资产类型徽章而非「无策略」
+  const kindLabel = ASSET_KIND_LABELS[metrics.assetKind];
+  if (kindLabel) return `<span class="badge badge-accent">${kindLabel}</span>`;
   const meta = statusMeta(metrics.status);
   return `<span class="badge badge-${meta.tone}">${esc(meta.label)}</span>`;
 }
@@ -156,7 +162,15 @@ function sparklineSvg(history) {
   return `<svg class="spark ${data.dir}" width="68" height="24" viewBox="0 0 68 24" aria-hidden="true"><polyline points="${data.points}"/></svg>`;
 }
 
-function fundCard(metrics, valuation = null) {
+/** 宏观方向提示行（锁定类基金）：替代补仓 hint */
+function macroAdviceHint(metrics, macro) {
+  const advice = computeMacroAdvice(metrics.assetKind, macro);
+  if (!advice) return '';
+  const prefix = `${ASSET_KIND_LABELS[metrics.assetKind]}基金不适用分档策略`;
+  return `<p class="fund-hint"><b class="t-${advice.tone}">◆</b> ${esc(prefix)} · ${esc(advice.text)}</p>`;
+}
+
+function fundCard(metrics, valuation = null, macro = null) {
   const { fund } = metrics;
   const hasPosition = metrics.avgCost > 0;
   const pnlPct = hasPosition ? metrics.holdingPnlPct : 0;
@@ -193,7 +207,11 @@ function fundCard(metrics, valuation = null) {
         </div>
       </div>
       ${ruleTrack(metrics)}
-      <p class="fund-hint${metrics.triggeredTiers.length ? ' is-alert' : ''}">${esc(nextTierHint(metrics))}</p>
+      ${
+        ASSET_KIND_LABELS[metrics.assetKind]
+          ? macroAdviceHint(metrics, macro)
+          : `<p class="fund-hint${metrics.triggeredTiers.length ? ' is-alert' : ''}">${esc(nextTierHint(metrics))}</p>`
+      }
     </article>`;
 }
 
@@ -212,7 +230,7 @@ function emptyState() {
     </div>`;
 }
 
-export function holdingsPage(state, metricsMap, { refreshing = false, filter = 'all', valuations = null } = {}) {
+export function holdingsPage(state, metricsMap, { refreshing = false, filter = 'all', valuations = null, macro = null } = {}) {
   const metricsList = state.funds
     .map((fund) => metricsMap.get(fund.id))
     .filter(Boolean)
@@ -290,7 +308,7 @@ export function holdingsPage(state, metricsMap, { refreshing = false, filter = '
       ${
         filteredList.length
           ? `<section class="fund-list">${filteredList
-              .map((metrics) => fundCard(metrics, valuations && valuations.get(metrics.fund.code)))
+              .map((metrics) => fundCard(metrics, valuations && valuations.get(metrics.fund.code), macro))
               .join('')}</section>`
           : metricsList.length
             ? `<div class="empty-state compact"><p>「${esc(activeFilter.label)}」状态下暂无基金</p></div>`
@@ -402,6 +420,7 @@ function tiersCard(metrics) {
 }
 
 function simulatorCard(metrics) {
+  if (!metrics.strategy) return ''; // 锁定类基金无策略，不显示补仓模拟器
   const defaultAmount = metrics.nextTier
     ? metrics.nextTier.amount
     : (metrics.strategy && metrics.strategy.addTiers[0]?.amount) || 1200;
@@ -443,7 +462,7 @@ export function simResultHtml(result, strategy) {
 }
 
 function addBatchesCard(metrics) {
-  if (!metrics.addBatches.length) return '';
+  if (!metrics.strategy || !metrics.addBatches.length) return ''; // 锁定类基金无补仓计划
   return `
     <section class="card">
       <h2 class="card-title">补仓批次</h2>
@@ -525,6 +544,7 @@ function tradesCard(metrics) {
 
 function manageCard(metrics) {
   const { fund } = metrics;
+  const lockedKind = Boolean(ASSET_KIND_LABELS[metrics.assetKind]); // 锁定类基金隐藏策略入口
   return `
     <section class="card">
       <h2 class="card-title">持仓管理</h2>
@@ -537,14 +557,28 @@ function manageCard(metrics) {
       </label>
       <div class="button-grid">
         <button class="btn ghost" type="button" data-action="manual-nav" data-fund="${esc(fund.id)}">手动录入净值</button>
-        <button class="btn ghost" type="button" data-action="override" data-fund="${esc(fund.id)}">策略方案</button>
-        <button class="btn ghost" type="button" data-action="reset-tiers" data-fund="${esc(fund.id)}">重置补仓档位</button>
+        ${lockedKind ? '' : `<button class="btn ghost" type="button" data-action="override" data-fund="${esc(fund.id)}">策略方案</button>
+        <button class="btn ghost" type="button" data-action="reset-tiers" data-fund="${esc(fund.id)}">重置补仓档位</button>`}
         <button class="btn ghost danger-text" type="button" data-action="delete-fund" data-fund="${esc(fund.id)}">删除基金</button>
       </div>
     </section>`;
 }
 
-export function detailPage(metrics) {
+/** 宏观方向卡（详情页，锁定类基金专用）：替代策略规则卡组 */
+function macroAdviceCard(metrics, macro) {
+  const kindLabel = ASSET_KIND_LABELS[metrics.assetKind];
+  const advice = computeMacroAdvice(metrics.assetKind, macro);
+  if (!kindLabel || !advice) return '';
+  return `
+    <section class="card">
+      <h2 class="card-title">宏观方向</h2>
+      <p class="card-sub">${esc(kindLabel)}基金不适用分档策略，按宏观指标给出方向参考</p>
+      <p class="fund-hint is-alert"><b class="t-${advice.tone}">◆</b> ${esc(advice.text)}</p>
+      <p class="card-empty">方向依据：债券看中债期限利差，黄金/海外看美债实际利率与曲线形态；宏观数据缺失时维持现有配置。</p>
+    </section>`;
+}
+
+export function detailPage(metrics, macro = null) {
   const { fund } = metrics;
   const hasPosition = metrics.avgCost > 0;
   const addCount = (fund.trades || []).filter((trade) => trade.type === 'BUY' && trade.source === 'ADD').length;
@@ -595,7 +629,7 @@ export function detailPage(metrics) {
         ${hasPosition ? `<p class="detail-foot">补仓 ${addCount} 次 · 记录 ${(fund.trades || []).length} 笔</p>` : '<p class="detail-foot">登记首笔买入后开始计算成本与规则线</p>'}
       </section>
 
-      ${ruleLadder(metrics)}
+      ${ASSET_KIND_LABELS[metrics.assetKind] ? macroAdviceCard(metrics, macro) : ruleLadder(metrics)}
       ${tiersCard(metrics)}
       ${simulatorCard(metrics)}
       ${addBatchesCard(metrics)}
@@ -717,7 +751,8 @@ export function strategyPage(state) {
       <section class="card notes">
         <h2 class="card-title">策略说明</h2>
         <ul class="notes-list">
-          <li><b>预置不可改：</b>普通 / 激进两套参数为只读预置；单只基金可在详情页选择「跟随全局 / 普通 / 激进 / 不启用」。</li>
+          <li><b>预置不可改：</b>普通 / 激进两套参数为只读预置；单只权益基金可在详情页选择「跟随全局 / 普通 / 激进 / 不启用」。</li>
+          <li><b>策略不适用于三类基金：</b>债券 / 黄金 / 海外（QDII）权益基金不适用分档策略，系统按宏观指标给出方向参考（见宏观页），详情页不提供策略覆盖。</li>
           <li><b>不启用的含义：</b>选择「不启用」后该基金不再计算止损 / 止盈 / 分档提醒，仅记录成本与收益。</li>
           <li><b>先判断该不该补：</b>基金经理变更、策略漂移、规模接近清盘或指数规则重大调整时，不动用补仓资金。</li>
           <li><b>补仓后必须换锚：</b>止损线与止盈线按新的平均成本重算，而不是继续套用首次买入价。</li>

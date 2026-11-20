@@ -157,7 +157,9 @@ export function computePosition(trades = []) {
 }
 
 export function computeFundMetrics(fund, defaultStrategy) {
-  const strategy = resolveStrategyByKey(defaultStrategy, fund && fund.strategyOverride);
+  const assetKind = fundAssetKind(fund);
+  // v1.18 起债券/黄金/海外权益基金不适用分档策略，strategy 强制 null（status 恒 'none'）
+  const strategy = assetKind === 'EQUITY' ? resolveStrategyByKey(defaultStrategy, fund && fund.strategyOverride) : null;
   const position = computePosition(fund.trades);
   const nav = num(fund.nav);
   const avgCost = position.avgCost;
@@ -269,7 +271,8 @@ export function computeFundMetrics(fund, defaultStrategy) {
     stopLossHit,
     takeProfitHit,
     trailingHit,
-    addBatches
+    addBatches,
+    assetKind
   };
 }
 
@@ -424,6 +427,76 @@ export function classifyAssetClass(ftype, indexCode = '') {
   if (type.includes('债券')) return 'BOND';
   if (type.includes('黄金') || (type.startsWith('指数型-其他') && idx === 'AU9999')) return 'GOLD';
   return 'EQUITY';
+}
+
+/**
+ * FTYPE 是否为海外（QDII）权益基金：含「海外」或「QDII」（大小写不敏感）→ true。
+ * QDII 债基（含「债券」）不算海外权益；空/非法 → false。
+ */
+export function isOverseasFtype(ftype) {
+  const type = String(ftype || '');
+  if (type.includes('债券')) return false;
+  return type.includes('海外') || type.toUpperCase().includes('QDII');
+}
+
+/**
+ * 基金策略口径分类：'BOND' | 'GOLD' | 'OVERSEAS' | 'EQUITY'。
+ * assetClass BOND/GOLD 直接锁定；FTYPE 含「债券」兜底 BOND（F10 未回时防御）；
+ * 海外（QDII）权益 → OVERSEAS；其余 → EQUITY。
+ */
+export function fundAssetKind(fund) {
+  const f = fund && typeof fund === 'object' ? fund : {};
+  if (f.assetClass === 'BOND') return 'BOND';
+  if (f.assetClass === 'GOLD') return 'GOLD';
+  const ftype = String(f.ftype || '');
+  if (ftype.includes('债券')) return 'BOND';
+  if (isOverseasFtype(ftype)) return 'OVERSEAS';
+  return 'EQUITY';
+}
+
+const MACRO_ADVICE_FLAT = '暂无宏观方向，维持现有配置';
+
+/**
+ * 三类基金的宏观方向建议（阈值与 views.computeQuickDirections 保持一致）：
+ * - BOND：中债期限利差 ≤30 宜增配（ok）/ ≥60 控久期（warn）/ 中间中性（accent）
+ * - GOLD：美债实际利率 ≤0 宜增配（ok）/ ≥2 宜减配（warn）/ 中间中性（accent）
+ * - OVERSEAS：实际利率 ≤0 偏友好（ok）/ ≥2 估值承压（warn）；美债曲线倒挂追加警示且 tone 至少 warn
+ * EQUITY → null；宏观数据缺失 → flat 降级文案。
+ */
+export function computeMacroAdvice(assetKind, macro) {
+  if (assetKind !== 'BOND' && assetKind !== 'GOLD' && assetKind !== 'OVERSEAS') return null;
+  const m = macro && typeof macro === 'object' ? macro : {};
+  const cnSpread = Number(m.cnTermSpreadBp);
+  const realRate = Number(m.usRealRate);
+  const usSpread = Number(m.usTermSpreadBp);
+
+  if (assetKind === 'BOND') {
+    if (!Number.isFinite(cnSpread)) return { tone: 'flat', text: MACRO_ADVICE_FLAT };
+    if (cnSpread <= 30) return { tone: 'ok', text: '中债期限利差收窄，债市友好，宜维持或增配债券' };
+    if (cnSpread >= 60) return { tone: 'warn', text: '中债期限利差走阔，久期风险上升，宜控制债券仓位' };
+    return { tone: 'accent', text: '中债期限利差中性，债券维持现有配置' };
+  }
+
+  if (!Number.isFinite(realRate)) return { tone: 'flat', text: MACRO_ADVICE_FLAT };
+
+  if (assetKind === 'GOLD') {
+    if (realRate <= 0) return { tone: 'ok', text: '美债实际利率低位，利于黄金，宜维持或增配黄金' };
+    if (realRate >= 2) return { tone: 'warn', text: '美债实际利率高位，持金机会成本上升，宜减配黄金' };
+    return { tone: 'accent', text: '美债实际利率中性，黄金维持现有配置' };
+  }
+
+  if (assetKind === 'OVERSEAS') {
+    let advice;
+    if (realRate <= 0) advice = { tone: 'ok', text: '美债实际利率低位，海外权益环境偏友好' };
+    else if (realRate >= 2) advice = { tone: 'warn', text: '美债实际利率高位，海外权益估值承压，宜控制仓位' };
+    else advice = { tone: 'accent', text: '美债实际利率中性，海外权益维持现有配置' };
+    if (Number.isFinite(usSpread) && usSpread < 0) {
+      advice = { tone: 'warn', text: `${advice.text}；美债曲线倒挂，警惕风险` };
+    }
+    return advice;
+  }
+
+  return null; // EQUITY 及未知类型无宏观方向卡
 }
 
 /**

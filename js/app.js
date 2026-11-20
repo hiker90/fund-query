@@ -3,6 +3,7 @@ import {
   backtestStrategy,
   classifyAssetClass,
   computeFundMetrics,
+  fundAssetKind,
   computeValuationLevel,
   num,
   parseBatchText,
@@ -189,11 +190,14 @@ function buildValuationMap() {
 async function loadMacro({ force = false } = {}) {
   if (macroLoading) return;
   macroLoading = true;
-  if (parseRoute().name === 'macro') render();
+  const name = parseRoute().name;
+  if (name === 'macro') render();
   try {
     const data = await fetchMacroData({ force });
     macroData = data;
-    if (parseRoute().name === 'macro') render();
+    // macro/holdings/detail 三路由都消费宏观数据（持仓/详情页用于宏观方向徽章）
+    const after = parseRoute().name;
+    if (name === after && ['macro', 'holdings', 'detail'].includes(after)) render();
   } finally {
     macroLoading = false;
   }
@@ -235,6 +239,13 @@ function updateTabs(route) {
   });
 }
 
+/** 存在锁定类基金（债券/黄金/海外）时静默拉取宏观数据（供宏观方向徽章用，失败不提示） */
+function ensureMacroForAdvice() {
+  if (!macroData && !macroLoading && state.funds.some((fund) => fundAssetKind(fund) !== 'EQUITY')) {
+    loadMacro().catch(() => {});
+  }
+}
+
 function render() {
   const route = parseRoute();
 
@@ -245,7 +256,8 @@ function render() {
       return;
     }
     currentFundId = fund.id;
-    app.innerHTML = views.detailPage(metricsFor(fund));
+    app.innerHTML = views.detailPage(metricsFor(fund), macroData);
+    ensureMacroForAdvice();
   } else if (route.name === 'strategy') {
     currentFundId = null;
     app.innerHTML = views.strategyPage(state);
@@ -268,10 +280,12 @@ function render() {
     app.innerHTML = views.holdingsPage(state, buildMetricsMap(), {
       refreshing,
       filter: holdingsFilter,
-      valuations: buildValuationMap()
+      valuations: buildValuationMap(),
+      macro: macroData
     });
     maybeAutoFetchHoldings();
     loadValuations().catch(() => {});
+    ensureMacroForAdvice();
   }
 
   updateTabs(route);
@@ -1034,6 +1048,11 @@ document.addEventListener('click', (event) => {
     }
     case 'override': {
       const fund = getFund(target.dataset.fund);
+      if (fund && fundAssetKind(fund) !== 'EQUITY') {
+        // 债券/黄金/海外基金锁定宏观推荐，按钮已隐藏，此为防御
+        toast('债券/黄金/海外基金不适用策略方案', 'warn');
+        break;
+      }
       if (fund) {
         showSheet({
           title: '策略方案',
