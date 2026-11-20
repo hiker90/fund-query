@@ -94,6 +94,8 @@ function sanitizeFund(fund) {
     navHistory,
     category: typeof fund.category === 'string' ? fund.category.trim() : '',
     assetClass: ASSET_CLASS_KEYS.includes(fund.assetClass) ? fund.assetClass : 'EQUITY',
+    ftype: typeof fund.ftype === 'string' ? fund.ftype.trim() : '',
+    assetClassAuto: fund.assetClassAuto !== false,
     strategyOverride,
     trades,
     tierState: Array.isArray(fund.tierState) ? fund.tierState.map(Boolean) : [],

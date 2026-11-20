@@ -3,6 +3,7 @@ import {
   DEFAULT_STRATEGY,
   DEFAULT_ASSET_TARGETS,
   STRATEGY_PRESETS,
+  classifyAssetClass,
   computeFundMetrics,
   computePosition,
   computeThreeAssetAllocation,
@@ -10,6 +11,7 @@ import {
   recommendAssetScheme,
   resolveStrategyByKey,
   simulateAdd,
+  summarizeAttention,
   validateStrategy
 } from '../js/strategy.js';
 import { VERSION, normalizeState } from '../js/store.js';
@@ -391,16 +393,115 @@ test('当日买入：shares 缺失时按 amount/nav 推导市值', () => {
   close(metrics.marketValue, 23000, 1e-6, 'shares 缺失按 amount/nav 推导');
 });
 
-// ===== 估值水平 computeValuationLevel =====
+// ===== 基金自动归类 classifyAssetClass（F10 FTYPE → 三资产） =====
 
-test('估值水平：高估 ≥70、低估 ≤30、中间正常（乱序输入按日期取最新）', () => {
-  const build = (currentNav) => {
-    const entries = [];
-    for (let i = 1; i <= 23; i += 1) {
-      entries.push({ date: `2026-01-${String(i).padStart(2, '0')}`, nav: i });
-    }
-    entries.push({ date: '2026-03-01', nav: currentNav }); // 日期最新 = 当前净值
-    return entries.reverse(); // 乱序输入
+test('自动归类：债券类型 → BOND', () => {
+  assert.equal(classifyAssetClass('债券型-混合二级'), 'BOND');
+  assert.equal(classifyAssetClass('被动债券型基金'), 'BOND');
+});
+
+test('自动归类：黄金类型 / 指数型-其他且跟踪 AU9999 → GOLD', () => {
+  assert.equal(classifyAssetClass('股票型-黄金'), 'GOLD');
+  assert.equal(classifyAssetClass('指数型-其他', 'AU9999'), 'GOLD');
+  assert.equal(classifyAssetClass('指数型-其他', 'au9999'), 'GOLD'); // 大小写不敏感
+  // 「指数型-其他」但非黄金标的 → 权益
+  assert.equal(classifyAssetClass('指数型-其他', 'H30269'), 'EQUITY');
+});
+
+test('自动归类：股票/指数/混合/QDII/空值 → EQUITY', () => {
+  assert.equal(classifyAssetClass('指数型-股票'), 'EQUITY');
+  assert.equal(classifyAssetClass('股票型'), 'EQUITY');
+  assert.equal(classifyAssetClass('混合型-偏股'), 'EQUITY');
+  assert.equal(classifyAssetClass('指数型-海外股票'), 'EQUITY');
+  assert.equal(classifyAssetClass(''), 'EQUITY');
+  assert.equal(classifyAssetClass(null), 'EQUITY');
+  assert.equal(classifyAssetClass(undefined, ''), 'EQUITY');
+});
+
+test('自动归类：FTYPE 原值与 ftype 缺省兼容（normalizeState 补齐）', () => {
+  const legacy = normalizeState({
+    version: VERSION,
+    funds: [{ code: '000961', name: 'x', nav: 1 }]
+  });
+  assert.equal(legacy.funds[0].ftype, '');
+  assert.equal(legacy.funds[0].assetClassAuto, true);
+});
+
+// ===== 今日关注聚合 summarizeAttention =====
+
+function attentionMetrics(status, extra = {}) {
+  return {
+    fund: { id: extra.id || 'f1', name: extra.name || '测试基金', code: '000001' },
+    status,
+    triggeredTiers: extra.triggeredTiers || [],
+    strategy: extra.strategy === undefined ? { takeProfitSellRatio: 40 } : extra.strategy,
+    ...extra
+  };
+}
+
+test('关注聚合：混合状态计数正确，非法状态按 normal 计数', () => {
+  const summary = summarizeAttention([
+    attentionMetrics('stop'),
+    attentionMetrics('add'),
+    attentionMetrics('add'),
+    attentionMetrics('takeProfit'),
+    attentionMetrics('nearStop'),
+    attentionMetrics('normal'),
+    attentionMetrics('none'),
+    { fund: { id: 'f8', name: 'x' }, status: 'bogus' }
+  ]);
+  assert.deepEqual(summary.counts, {
+    stop: 1, trailing: 0, takeProfit: 1, add: 2, nearStop: 1, normal: 2, none: 1
+  });
+  assert.equal(summary.items.length, 5);
+});
+
+test('关注聚合：条目按严重度排序（stop 最前，nearStop 最后）', () => {
+  const summary = summarizeAttention([
+    attentionMetrics('nearStop', { id: 'a' }),
+    attentionMetrics('add', { id: 'b' }),
+    attentionMetrics('stop', { id: 'c' }),
+    attentionMetrics('trailing', { id: 'd' })
+  ]);
+  assert.deepEqual(
+    summary.items.map((i) => i.status),
+    ['stop', 'trailing', 'add', 'nearStop']
+  );
+});
+
+test('关注聚合：takeProfit 文案带预设卖出比例；add 多档合并金额求和', () => {
+  const summary = summarizeAttention([
+    attentionMetrics('takeProfit', { strategy: { takeProfitSellRatio: 40 } }),
+    attentionMetrics('add', {
+      triggeredTiers: [
+        { index: 0, amount: 1200 },
+        { index: 2, amount: 2800 }
+      ]
+    })
+  ]);
+  assert.equal(summary.items[0].text, '触发止盈 → 可按预设先卖 40%');
+  assert.equal(summary.items[1].text, '第 1 档、第 3 档触发 → 可补仓 4000 元');
+});
+
+test('关注聚合：normal/none 不产条目；空列表全零；名称缺失兜底基金代码', () => {
+  const empty = summarizeAttention([]);
+  assert.equal(empty.items.length, 0);
+  assert.deepEqual(empty.counts, {
+    stop: 0, trailing: 0, takeProfit: 0, add: 0, nearStop: 0, normal: 0, none: 0
+  });
+  const noName = summarizeAttention([{ fund: { id: 'f9', code: '888888' }, status: 'stop' }]);
+  assert.equal(noName.items[0].name, '888888');
+  assert.equal(summarizeAttention(null).items.length, 0);
+});
+
+// ===== 估值水平 computeValuationLevel（通用序列分位 + 分级 + 债券取反） =====
+
+test('估值水平：高估 ≥70、低估 ≤30、中间正常（缺省当前值取序列末项）', () => {
+  const build = (currentVal) => {
+    const list = [];
+    for (let i = 1; i <= 23; i += 1) list.push(i);
+    list.push(currentVal); // 末项 = 当前值
+    return list;
   };
 
   const high = computeValuationLevel(build(30)); // 24 条全部 ≤ 30 → 100%
@@ -413,60 +514,68 @@ test('估值水平：高估 ≥70、低估 ≤30、中间正常（乱序输入�
   assert.equal(low.label, '低估');
   assert.equal(low.tone, 'down');
 
-  const mid = computeValuationLevel(build(12.5)); // ≤12.5：navs 1–12 共 12 条 + 当前 → 13/24 ≈ 54.17%
+  const mid = computeValuationLevel(build(12.5)); // ≤12.5：1–12 共 12 条 + 当前 → 13/24 ≈ 54.17%
   close(mid.percentile, (13 / 24) * 100, 1e-6, '中位分位');
   assert.equal(mid.label, '正常');
   assert.equal(mid.tone, 'flat');
 });
 
-test('估值水平：边界值 30 与 70', () => {
-  // 20 条样本：5 条 ≤6 的净值 + 14 条大净值 + 当前（最新日期）nav=6 → 6/20 = 30% → 低估
-  const entries30 = [];
-  for (let i = 0; i < 5; i += 1) entries30.push({ date: `2026-01-${String(i + 1).padStart(2, '0')}`, nav: i + 1 });
-  for (let i = 0; i < 14; i += 1) entries30.push({ date: `2026-02-${String(i + 1).padStart(2, '0')}`, nav: 50 + i });
-  entries30.push({ date: '2026-03-01', nav: 6 });
-  const level30 = computeValuationLevel(entries30);
-  close(level30.percentile, 30, 1e-9, '边界 30%');
-  assert.equal(level30.label, '低估');
+test('估值水平：显式传入当前值 + 边界值 30 与 70', () => {
+  const list = [1, 2, 3, 4, 5, 6, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63];
 
-  // 13 条小净值 + 6 条大净值 + 当前（最新日期）nav=20 → 14/20 = 70% → 高估
-  const entries70 = [];
-  for (let i = 0; i < 13; i += 1) entries70.push({ date: `2026-01-${String(i + 1).padStart(2, '0')}`, nav: i + 1 });
-  for (let i = 0; i < 6; i += 1) entries70.push({ date: `2026-02-${String(i + 1).padStart(2, '0')}`, nav: 50 + i });
-  entries70.push({ date: '2026-03-01', nav: 20 });
-  const level70 = computeValuationLevel(entries70);
-  close(level70.percentile, 70, 1e-9, '边界 70%');
-  assert.equal(level70.label, '高估');
+  // ≤56：1–6 共 6 条 + 50–56 共 7 条 = 13 → 13/20 = 65% → 正常
+  close(computeValuationLevel(list, 56).percentile, 65, 1e-9, '65% 正常');
+  assert.equal(computeValuationLevel(list, 56).label, '正常');
+
+  // 边界 70：≤57 = 14 条 → 14/20 = 70% → 高估
+  close(computeValuationLevel(list, 57).percentile, 70, 1e-9, '边界 70%');
+  assert.equal(computeValuationLevel(list, 57).label, '高估');
+
+  // 边界 30：≤6 = 6 条（含当前 6）→ 6/20 = 30% → 低估
+  const b30 = [1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7];
+  close(computeValuationLevel(b30, 6).percentile, 30, 1e-9, '边界 30%');
+  assert.equal(computeValuationLevel(b30, 6).label, '低估');
 });
 
-test('估值水平：样本不足 20 / 空 / 非法输入 → null', () => {
+test('估值水平：债券口径 invert=true 分位取反（收益率低=债贵=高估）', () => {
+  // 20 条收益率样本：≤2.0 仅当前 1 条 → 原分位 5%（低估区间），取反后 95% → 高估
+  const yields = [2.0, 3.0, 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 4.0, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 4.8];
+  const inverted = computeValuationLevel(yields, 2.0, { invert: true });
+  close(inverted.percentile, 95, 1e-9, '100 − 5 = 95');
+  assert.equal(inverted.label, '高估');
+  assert.equal(inverted.tone, 'warn');
+
+  // 不取反时同序列为低估
+  const normal = computeValuationLevel(yields, 2.0);
+  close(normal.percentile, 5, 1e-9, '原分位 5%');
+  assert.equal(normal.label, '低估');
+});
+
+test('估值水平：指数价格分位 ≡ 常数盈利 PE 分位（价格同比例序列等价）', () => {
+  // 价格序列与「价格 × 100 / 固定盈利」的 PE 序列分位完全一致
+  const prices = Array.from({ length: 40 }, (_, i) => 3000 + i * 10); // 单调上涨
+  const peFromPrices = prices.map((p) => p / 100); // EPS=100 的常数盈利近似
+  close(computeValuationLevel(prices, prices[39]).percentile, 100, 1e-9, '价格分位');
+  close(computeValuationLevel(peFromPrices, peFromPrices[39]).percentile, 100, 1e-9, 'PE 分位');
+  assert.equal(computeValuationLevel(prices, prices[39]).label, computeValuationLevel(peFromPrices, peFromPrices[39]).label);
+});
+
+test('估值水平：样本不足 20 / 空 / 非法输入 / 非法当前值 → null', () => {
   assert.equal(computeValuationLevel([]), null);
   assert.equal(computeValuationLevel(null), null);
   assert.equal(computeValuationLevel(undefined), null);
   assert.equal(computeValuationLevel('oops'), null);
-  assert.equal(computeValuationLevel([{ date: '2026-01-01', nav: 1 }]), null);
-  const nineteen = Array.from({ length: 19 }, (_, i) => ({
-    date: `2026-01-${String(i + 1).padStart(2, '0')}`,
-    nav: 1 + i / 100
-  }));
+  assert.equal(computeValuationLevel([1, 2, 3]), null);
+  const nineteen = Array.from({ length: 19 }, (_, i) => 1 + i / 100);
   assert.equal(computeValuationLevel(nineteen), null);
-});
+  assert.equal(computeValuationLevel(nineteen, 1.05), null); // 样本仍不足
 
-test('估值水平：纯数字数组取末项为当前值，非法净值被过滤', () => {
-  const list = [50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 1];
-  // 末项 1 为当前 → 仅 1 条 ≤1 → 5% → 低估
-  const level = computeValuationLevel(list);
-  close(level.percentile, 5, 1e-9, '分位');
-  assert.equal(level.label, '低估');
+  // 非法值（0/NaN/负数）被过滤，不影响分母
+  const mixed = [0, Number.NaN, -1, ...Array.from({ length: 20 }, (_, i) => i + 1)];
+  close(computeValuationLevel(mixed, 20).percentile, 100, 1e-9, '过滤后分母 20');
 
-  // nav 0 / NaN 条目被过滤，不影响分母
-  const mixed = [{ date: '2026-01-01', nav: 0 }, { date: 'x', nav: Number.NaN }];
-  for (let i = 1; i <= 20; i += 1) {
-    mixed.push({ date: `2026-02-${String(i).padStart(2, '0')}`, nav: i });
-  }
-  const filtered = computeValuationLevel(mixed); // 当前 nav=20（日期最新）→ 20/20 = 100%
-  close(filtered.percentile, 100, 1e-9, '过滤后分母 20');
-  assert.equal(filtered.label, '高估');
+  // 过滤后样本不足 → null
+  assert.equal(computeValuationLevel([0, Number.NaN, 1, 2, 3]), null);
 });
 
 // ===== store.normalizeState 策略迁移（version 2/3 兼容、幂等） =====

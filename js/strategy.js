@@ -372,39 +372,94 @@ export function validateStrategy(draft) {
   return errors;
 }
 
-/**
- * 估值水平：近一年单位净值分位。
- * percentile = 净值数组中 ≤ 当前（最新）净值的样本数 / 样本总数 × 100
- * - 当前（最新）净值 = 日期（YYYY-MM-DD）最大的一条；无日期时取数组末项
- * - 元素支持 { date, nav } 对象（任意顺序）或纯数字
- * - percentile ≤ 30 → { label: '低估', tone: 'down' }；30–70 → '正常'（'flat'）；≥ 70 → '高估'（'warn'）
- * - 有效样本 < 20 条或输入为空 → null（界面不显示标签）
- */
-export function computeValuationLevel(navList) {
-  const list = (Array.isArray(navList) ? navList : [])
-    .map((item) => {
-      if (item && typeof item === 'object') {
-        const date = typeof item.date === 'string' ? item.date : '';
-        return { date, nav: num(item.nav) };
-      }
-      return { date: '', nav: num(item) };
-    })
-    .filter((item) => item.nav > EPS);
+/** 今日关注条目的严重度排序（stop 最前；normal/none 不产条目） */
+export const ATTENTION_ORDER = Object.freeze(['stop', 'trailing', 'takeProfit', 'add', 'nearStop']);
 
+/**
+ * 持仓页「今日关注」聚合：从 metrics 列表提取需要行动的基金。
+ * 输入元素为 computeFundMetrics 结果（含 fund/status/triggeredTiers/strategy），
+ * 仅 stop/trailing/takeProfit/add/nearStop 产生条目，normal/none 只计数。
+ * 纯函数：非法/缺失输入按 normal 计数，不抛错。
+ */
+export function summarizeAttention(metricsList) {
+  const counts = { stop: 0, trailing: 0, takeProfit: 0, add: 0, nearStop: 0, normal: 0, none: 0 };
+  const items = [];
+  for (const m of Array.isArray(metricsList) ? metricsList : []) {
+    const status = counts.hasOwnProperty(m && m.status) ? m.status : 'normal';
+    counts[status] += 1;
+    if (!ATTENTION_ORDER.includes(status)) continue;
+    const name = String((m.fund && (m.fund.name || m.fund.code)) || '').trim();
+    let text = '';
+    if (status === 'stop') {
+      text = '触发止损 → 按策略评估卖出';
+    } else if (status === 'trailing') {
+      text = '移动止盈触发 → 峰值回撤达阈值，评估止盈';
+    } else if (status === 'takeProfit') {
+      const ratio = Math.round(num(m.strategy && m.strategy.takeProfitSellRatio));
+      text = ratio > 0 ? `触发止盈 → 可按预设先卖 ${ratio}%` : '触发止盈 → 评估部分止盈';
+    } else if (status === 'add') {
+      const tiers = Array.isArray(m.triggeredTiers) ? m.triggeredTiers : [];
+      const indexes = tiers.map((tier) => `第 ${num(tier.index) + 1} 档`).join('、');
+      const total = tiers.reduce((sum, tier) => sum + num(tier.amount), 0);
+      text = `${indexes}触发 → 可补仓 ${Math.round(total)} 元`;
+    } else if (status === 'nearStop') {
+      text = '接近止损 → 复核基金逻辑，评估是否减仓';
+    }
+    items.push({ fundId: (m.fund && m.fund.id) || '', name, status, text });
+  }
+  items.sort((a, b) => ATTENTION_ORDER.indexOf(a.status) - ATTENTION_ORDER.indexOf(b.status));
+  return { counts, items };
+}
+
+/**
+ * 基金类型（东财 F10 FTYPE 原值）→ 三资产类别（EQUITY/BOND/GOLD）。
+ * - FTYPE 含「债券」→ BOND
+ * - FTYPE 含「黄金」或「指数型-其他」且跟踪标的为 AU9999 → GOLD
+ * - 其余（股票型/指数型/混合型/QDII/货币等）→ EQUITY
+ * 纯函数：空值/非法输入一律归 EQUITY。
+ */
+export function classifyAssetClass(ftype, indexCode = '') {
+  const type = String(ftype || '');
+  const idx = String(indexCode || '').toUpperCase();
+  if (type.includes('债券')) return 'BOND';
+  if (type.includes('黄金') || (type.startsWith('指数型-其他') && idx === 'AU9999')) return 'GOLD';
+  return 'EQUITY';
+}
+
+/**
+ * 估值分位分级：percentile ≤ 30 → '低估'（down）；≥ 70 → '高估'（warn）；其余 → '正常'（flat）。
+ * 非法分位返回 null。
+ */
+export function gradeValuationPercentile(percentile) {
+  if (!Number.isFinite(percentile)) return null;
+  if (percentile <= 30) return { label: '低估', tone: 'down' };
+  if (percentile >= 70) return { label: '高估', tone: 'warn' };
+  return { label: '正常', tone: 'flat' };
+}
+
+/**
+ * 估值水平：当前值在历史序列中的分位 + 分级。
+ * percentile = 序列中 ≤ 当前值的样本数 / 样本总数 × 100
+ * @param {number[]} values 历史样本（非法值自动过滤）
+ * @param {number} current 当前值（缺省取序列最后一项）
+ * @param {{invert?: boolean}} opts invert=true：分位取反。用于债券收益率口径：
+ *   收益率越低 = 债券越贵 = 估值分位越高（100 − 原分位）
+ * - 分级阈值见 gradeValuationPercentile
+ * - 有效样本 < 20 条或当前值非法 → null（界面不显示标签）
+ */
+export function computeValuationLevel(values, current = null, opts = {}) {
+  const list = (Array.isArray(values) ? values : []).map(num).filter((v) => v > EPS);
   if (list.length < 20) return null;
 
-  const dateRe = /^\d{4}-\d{2}-\d{2}$/;
-  const dated = list.filter((item) => dateRe.test(item.date));
-  const currentNav = dated.length
-    ? dated.reduce((latest, item) => (item.date > latest.date ? item : latest)).nav
-    : list[list.length - 1].nav;
+  const currentVal = Number.isFinite(current) && current > EPS ? current : list[list.length - 1];
+  if (!(currentVal > EPS)) return null;
 
-  const belowOrEqual = list.filter((item) => item.nav <= currentNav + EPS).length;
-  const percentile = (belowOrEqual / list.length) * 100;
+  const belowOrEqual = list.filter((v) => v <= currentVal + EPS).length;
+  let percentile = (belowOrEqual / list.length) * 100;
+  if (opts && opts.invert) percentile = 100 - percentile;
 
-  if (percentile <= 30) return { percentile, label: '低估', tone: 'down' };
-  if (percentile >= 70) return { percentile, label: '高估', tone: 'warn' };
-  return { percentile, label: '正常', tone: 'flat' };
+  const grade = gradeValuationPercentile(percentile);
+  return grade ? { percentile, ...grade } : null;
 }
 
 /**

@@ -1,5 +1,6 @@
 import * as store from './store.js';
 import {
+  classifyAssetClass,
   computeFundMetrics,
   computeValuationLevel,
   num,
@@ -8,8 +9,8 @@ import {
   simulateAdd,
   STRATEGY_KEYS
 } from './strategy.js';
-import { fetchQuotes, fetchValuationHistory, isFundCode } from './quote.js';
-import { fetchMacroData } from './macro.js';
+import { fetchQuotes, fetchFundBasicInfo, isFundCode } from './quote.js';
+import { fetchMacroData, fetchKlineClose } from './macro.js';
 import * as views from './views.js';
 import {
   confirmDialog,
@@ -39,6 +40,83 @@ const valuationCache = new Map();
 const VALUATION_TTL_MS = 30 * 60 * 1000;
 let valuationLoading = false;
 
+// 估值序列窗口：约 2 年自然日（≈500 个交易日），满足各类型分位样本要求
+const VALUATION_KLINE_DAYS = 750;
+const VALUATION_BEG = (() => {
+  const d = new Date(Date.now() - VALUATION_KLINE_DAYS * 24 * 3600 * 1000);
+  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+})();
+
+// 债券/黄金估值序列标的：中债10Y收益率（分位取反）、COMEX 黄金
+const BOND_YIELD_SECID = '171.CN10Y';
+const GOLD_PRICE_SECID = '101.GC00Y';
+
+/**
+ * F10 基金类型自动归类三资产：
+ * - fund.ftype 始终更新为 FTYPE 原值（持仓卡片展示用）
+ * - assetClassAuto !== false（未手动改过大类）时按 classifyAssetClass 自动归入 EQUITY/BOND/GOLD
+ * 返回是否有字段变化（需要持久化）。
+ */
+function applyFundClassification(fund, info) {
+  if (!info || !info.ftype) return false;
+  let changed = fund.ftype !== info.ftype;
+  fund.ftype = info.ftype;
+  if (fund.assetClassAuto !== false) {
+    const derived = classifyAssetClass(info.ftype, info.indexCode);
+    if (derived !== fund.assetClass) {
+      fund.assetClass = derived;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * 按基金类型确定估值口径（F10 基本信息优先，assetClass 兜底）：
+ * - 债券（assetClass=BOND 或 FTYPE 含「债券」）→ 中债10Y收益率分位取反
+ * - 黄金（assetClass=GOLD 或 FTYPE「指数型-其他」且 INDEXCODE=AU9999）→ 金价分位
+ * - 指数股票（FTYPE「指数型-股票」+ 6 位 INDEXCODE + 交易所 0/1）→ 跟踪指数价格分位
+ * - 主动/行业/QDII 基金 → null（不展示估值标签）
+ */
+function resolveValuationKind(fund, info) {
+  const ftype = info ? String(info.ftype || '') : '';
+  const indexCode = info ? String(info.indexCode || '') : '';
+  const indexExchange = info ? String(info.indexExchange || '') : '';
+
+  if (fund.assetClass === 'BOND' || ftype.includes('债券')) {
+    return { kind: 'bond', key: 'bond' };
+  }
+  if (fund.assetClass === 'GOLD' || (ftype.startsWith('指数型-其他') && indexCode === 'AU9999')) {
+    return { kind: 'gold', key: 'gold' };
+  }
+  if (
+    ftype.startsWith('指数型-股票') &&
+    /^\d{6}$/.test(indexCode) &&
+    (indexExchange === '0' || indexExchange === '1')
+  ) {
+    return { kind: 'index', key: `index:${indexExchange}.${indexCode}`, secid: `${indexExchange}.${indexCode}` };
+  }
+  return null;
+}
+
+function valuationSecid(kind) {
+  if (kind.kind === 'bond') return BOND_YIELD_SECID;
+  if (kind.kind === 'gold') return GOLD_PRICE_SECID;
+  return kind.secid;
+}
+
+/** 拉取某估值口径的分位结果；失败/样本不足返回 null（缓存期内不重试） */
+async function fetchValuationLevelForKind(kind) {
+  try {
+    const series = await fetchKlineClose(valuationSecid(kind), VALUATION_BEG);
+    if (!series || series.length < 20) return null;
+    const closes = series.map((point) => point.close);
+    return computeValuationLevel(closes, closes[closes.length - 1], { invert: kind.kind === 'bond' });
+  } catch {
+    return null;
+  }
+}
+
 function maybeAutoFetchHoldings() {
   if (refreshing) return;
   const now = Date.now();
@@ -58,16 +136,39 @@ async function loadValuations() {
   if (targets.length === 0) return;
 
   valuationLoading = true;
+  let classificationChanged = false;
   try {
-    await Promise.all(
+    // 1. F10 基本信息分流：确定每只基金的估值口径 + 自动归类三资产（主动/行业基金直接 null，不发后续请求）
+    const kinds = await Promise.all(
       targets.map(async (fund) => {
-        const history = await fetchValuationHistory(fund.code); // 失败返回 null
-        valuationCache.set(fund.code, {
-          level: history ? computeValuationLevel(history) : null,
-          fetchedAt: Date.now()
-        });
+        const info = await fetchFundBasicInfo(fund.code);
+        if (applyFundClassification(fund, info)) classificationChanged = true;
+        return [fund.code, resolveValuationKind(fund, info)];
       })
     );
+
+    // 2. 同口径共享一条序列（债券/黄金全市场共用，指数按 secid 共用），去重后并发拉取
+    const levelByKey = new Map(); // key → level（占位 null，拉取成功后覆盖）
+    const jobs = [];
+    for (const [, kind] of kinds) {
+      if (!kind || levelByKey.has(kind.key)) continue;
+      levelByKey.set(kind.key, null);
+      jobs.push(
+        fetchValuationLevelForKind(kind).then((level) => {
+          levelByKey.set(kind.key, level);
+        })
+      );
+    }
+    await Promise.all(jobs);
+
+    // 3. 写回基金级缓存（null 也写入，TTL 内不重试）
+    for (const [code, kind] of kinds) {
+      valuationCache.set(code, {
+        level: kind ? levelByKey.get(kind.key) : null,
+        fetchedAt: Date.now()
+      });
+    }
+    if (classificationChanged) store.save(state); // 自动归类有变化时持久化（渲染统一走末尾）
   } finally {
     valuationLoading = false;
   }
@@ -329,6 +430,7 @@ async function confirmBatchImport() {
         name: (quote && quote.name) || `基金 ${row.code}`,
         category: '',
         assetClass: 'EQUITY',
+        assetClassAuto: true,
         nav,
         navDate: nav > 0 ? navDate : '',
         navUpdatedAt: nav > 0 ? Date.now() : 0,
@@ -367,6 +469,21 @@ async function confirmBatchImport() {
     if (newFunds.length) {
       state.funds.push(...newFunds);
       store.save(state);
+      // 异步拉取 F10 基金类型：FTYPE 原值 + 自动归类三资产
+      Promise.all(
+        newFunds.map(async (fund) => {
+          try {
+            return applyFundClassification(fund, await fetchFundBasicInfo(fund.code));
+          } catch {
+            return false;
+          }
+        })
+      ).then((results) => {
+        if (results.some(Boolean)) {
+          store.save(state);
+          render();
+        }
+      });
     }
     batchParsed = null;
     hideSheet();
@@ -472,6 +589,8 @@ function handleAddFund(form) {
     name,
     category,
     assetClass,
+    // 显式选择债券/黄金 → 视为手动指定，自动归类不再覆盖；默认权益 → 跟随 FTYPE 自动归类
+    assetClassAuto: assetClass === 'EQUITY',
     nav,
     navDate: nav > 0 ? navDate : '',
     navUpdatedAt: nav > 0 ? Date.now() : 0,
@@ -505,6 +624,15 @@ function handleAddFund(form) {
   render();
   toast('已加入监控', 'success');
   if (parseRoute().name !== 'holdings') location.hash = '#/holdings';
+
+  // 异步拉取 F10 基金类型：FTYPE 原值 + 自动归类三资产（表单里显式选了债券/黄金则视为手动指定）
+  fetchFundBasicInfo(fund.code)
+    .then((info) => {
+      if (!applyFundClassification(fund, info)) return;
+      store.save(state);
+      render();
+    })
+    .catch(() => {});
 }
 
 function handleStrategy(form) {
@@ -847,6 +975,10 @@ document.addEventListener('click', (event) => {
       holdingsFilter = target.dataset.filter || 'all';
       render();
       break;
+    case 'toggle-attention':
+      views.toggleAttentionExpanded();
+      render();
+      break;
     case 'lookup-fund':
       lookupFund(target);
       break;
@@ -1107,13 +1239,14 @@ document.addEventListener('change', (event) => {
     return;
   }
 
-  // 修改基金资产大类（权益/债券/黄金）
+  // 修改基金资产大类（权益/债券/黄金）：手动指定后关闭自动归类
   const classSelect = event.target.closest('[data-action="change-fund-class"]');
   if (classSelect) {
     const fund = getFund(classSelect.dataset.fund);
     const value = String(classSelect.value || '');
     if (fund && ['EQUITY', 'BOND', 'GOLD'].includes(value)) {
       fund.assetClass = value;
+      fund.assetClassAuto = false;
       commit();
       toast(`已将「${fund.name}」归入${value === 'EQUITY' ? '权益' : value === 'BOND' ? '债券' : '黄金'}大类`);
     }

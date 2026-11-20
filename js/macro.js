@@ -4,9 +4,8 @@
  * 与中国10年期国债收益率，分位窗口为近5年。
  *
  * 指标口径（界面均已标注）：
- * - 期限利差：东财全球债无 2Y 品种，用 10Y−5Y（美国 / 中国各一条）
+ * - 期限利差：中/美均采用 10Y−2Y 口径（东财全球债有 2Y 品种：171.CN2Y / 171.US2Y）
  * - 美国实际利率：美国通胀预期无 CORS 接口，用 US10Y − WTI 同比 近似
- * - 信用利差：中债企业债收益率曲线无免费公开接口，以中美10年期国债利差作为跨境利差参考
  *
  * 数据源兜底链路（任一层失败自动降级到下一层）：
  * 1. 东财 push2 主域 → 镜像域名轮询（push2delay / 90.push2 等）
@@ -18,9 +17,9 @@
 const TIMEOUT_MS = 10000;
 const CACHE_TTL = 5 * 60 * 1000; // 5 分钟内存缓存
 const HISTORY_YEARS = 5;
-const OIL_HISTORY_DAYS = 400; // 取 1 年多一点的 WTI 日K，保证能找到 365 天前的锚点
+const OIL_HISTORY_DAYS = 450; // 取 450 个自然日 WTI 日K：一年约 250 个交易日，留足余量保证 365 天锚点在窗口内
 
-const MACO_SECIDS = '171.US10Y,171.US05Y,100.UDI,171.CN10Y,171.CN05Y,101.GC00Y,102.CL00Y,1.000300';
+const MACO_SECIDS = '171.US10Y,171.US2Y,100.UDI,171.CN10Y,171.CN2Y,101.GC00Y,102.CL00Y,1.000300';
 const CSI300_SECID = '1.000300';
 
 // 东财行情镜像域名（主域不可用时轮询）
@@ -148,16 +147,18 @@ export async function fetchMacroQuotes() {
   return map;
 }
 
-/** 沪深300 当前 PE-TTM（指数行情 f115 字段） */
+/** 沪深300 当前 PE-TTM（近似口径）。
+ * 指数行情 f115/f162 均非可靠 PE（多请求取值跳变），f114/10 数值接近真实 PE-TTM，
+ * 采用 f114 ÷ 10 近似，合理性 guard：5 ≤ PE ≤ 200 才采纳，否则返回 0（界面降级显示）。 */
 async function fetchCsi300Pe() {
   const payload = await fetchJsonFallback(QUOTE_HOSTS, '/api/qt/stock/get', {
     secid: CSI300_SECID,
     fltt: '2',
-    fields: 'f43,f58,f115'
+    fields: 'f43,f58,f114'
   });
   const data = (payload && payload.data) || {};
-  const pe = Number(data.f115);
-  return Number.isFinite(pe) && pe > 0 ? pe : 0;
+  const pe = Number(data.f114) / 10;
+  return Number.isFinite(pe) && pe >= 5 && pe <= 200 ? pe : 0;
 }
 
 /** 日K收盘序列：[{date:'YYYY-MM-DD', close:Number}] */
@@ -323,11 +324,11 @@ export function computeSpreadBp(longPct, shortPct) {
 
 /**
  * WTI 同比（%）：以「最后交易日 − 365 天」为锚点，取日期最接近的收盘价计算。
- * 样本不足 300 条或序列非法时返回 null。
+ * 一年交易日约 250 条（自然日窗口含周末/假期会稀释样本），样本不足 250 条或序列非法时返回 null。
  */
 export function computeOilYoy(series) {
   const list = (series || []).filter((p) => p && Number.isFinite(p.close) && p.close > 0);
-  if (list.length < 300) return null;
+  if (list.length < 250) return null;
   const last = list[list.length - 1];
   const lastMs = Date.parse(last.date);
   if (!Number.isFinite(lastMs)) return null;
@@ -353,6 +354,75 @@ export function computeOilYoy(series) {
 export function computeRealRate(us10yPct, inflationProxyPct) {
   if (!Number.isFinite(us10yPct) || !Number.isFinite(inflationProxyPct)) return null;
   return us10yPct - inflationProxyPct;
+}
+
+/** 本地日期 YYYY-MM-DD（经济数据当日缓存用） */
+function todayLocal() {
+  const d = new Date();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+/**
+ * 经济数据提取（纯函数）：从东财数据中心返回行中取各指标最新有效值。
+ * 行按 REPORT_DATE 倒序；每个指标独立向下找第一条有效行。
+ * 全部缺失返回 null。
+ * @returns {{cpiYoy:number|null, ppiYoy:number|null, pmi:number|null, pmiNonMfg:number|null, time:string}|null}
+ */
+export function extractLatestEconomy(cpiRows, ppiRows, pmiRows) {
+  const firstValid = (rows, keys) => {
+    for (const row of rows || []) {
+      if (!row || typeof row !== 'object') continue;
+      const values = keys.map((k) => Number(row[k]));
+      if (values.every((v) => Number.isFinite(v))) {
+        return { values, time: String(row.TIME || row.REPORT_DATE || '') };
+      }
+    }
+    return null;
+  };
+  const cpi = firstValid(cpiRows, ['NATIONAL_SAME']);
+  const ppi = firstValid(ppiRows, ['BASE_SAME']);
+  const pmi = firstValid(pmiRows, ['MAKE_INDEX', 'NMAKE_INDEX']);
+  if (!cpi && !ppi && !pmi) return null;
+  return {
+    cpiYoy: cpi ? cpi.values[0] : null,
+    ppiYoy: ppi ? ppi.values[0] : null,
+    pmi: pmi ? pmi.values[0] : null,
+    pmiNonMfg: pmi ? pmi.values[1] : null,
+    // '2026年10月份' → '2026年10月'
+    time: (pmi || ppi || cpi).time.replace(/份$/, '')
+  };
+}
+
+// —— 经济数据（CPI/PPI/PMI，月度）——
+// 月度数据更新慢（每月 9 日前后公布），缓存「当日有效」，与行情 5 分钟缓存分开
+const ECONOMY_REPORTS = ['RPT_ECONOMY_CPI', 'RPT_ECONOMY_PPI', 'RPT_ECONOMY_PMI'];
+const ECONOMY_HOST = 'https://datacenter-web.eastmoney.com';
+let economyCache = null; // { data, day: 'YYYY-MM-DD' }
+
+async function fetchEconomyReport(reportName) {
+  const payload = await fetchJson(
+    `${ECONOMY_HOST}/api/data/v1/get?reportName=${reportName}&columns=ALL&pageSize=6&sortColumns=REPORT_DATE&sortTypes=-1`
+  );
+  return (payload && payload.result && payload.result.data) || [];
+}
+
+/**
+ * 拉取 CPI/PPI/PMI 最新值（当日内存缓存）。
+ * 失败返回 null 且不写缓存（下次调用可重试）。
+ */
+export async function fetchEconomyData({ force = false } = {}) {
+  const today = todayLocal();
+  if (!force && economyCache && economyCache.day === today) return economyCache.data;
+  try {
+    const [cpiRows, ppiRows, pmiRows] = await Promise.all(ECONOMY_REPORTS.map(fetchEconomyReport));
+    const data = extractLatestEconomy(cpiRows, ppiRows, pmiRows);
+    if (data) economyCache = { data, day: today };
+    return data;
+  } catch {
+    return null;
+  }
 }
 
 function dateOffset(days) {
@@ -408,26 +478,24 @@ export async function fetchMacroData({ force = false, history = true } = {}) {
 
   const pick = (code) => quotes.get(code) || { code, name: '', price: 0, changePct: 0 };
   const us10y = pick('US10Y');
-  const us05y = pick('US05Y');
+  const us2y = pick('US2Y');
   const dxy = pick('UDI');
   const cn10y = pick('CN10Y');
-  const cn05y = pick('CN05Y');
+  const cn2y = pick('CN2Y');
   const gold = pick('GC00Y');
   const oil = pick('CL00Y');
   const csi300 = pick('000300');
 
   const data = {
     us10y: { ...us10y, unit: '%' },
-    us05y: { ...us05y, unit: '%' },
+    us2y: { ...us2y, unit: '%' },
     dxy,
     cn10y: { ...cn10y, unit: '%' },
-    cn05y: { ...cn05y, unit: '%' },
-    // 美债期限利差（bp）：US10Y − US05Y
-    usTermSpreadBp: computeSpreadBp(us10y.price, us05y.price),
-    // 中国期限利差（bp）：CN10Y − CN05Y
-    cnTermSpreadBp: computeSpreadBp(cn10y.price, cn05y.price),
-    // 中美10年期国债利差（bp）：中国10Y − 美国10Y
-    cnUsSpreadBp: us10y.price > 0 && cn10y.price > 0 ? (cn10y.price - us10y.price) * 100 : null,
+    cn2y: { ...cn2y, unit: '%' },
+    // 美债期限利差（bp）：US10Y − US2Y
+    usTermSpreadBp: computeSpreadBp(us10y.price, us2y.price),
+    // 中国期限利差（bp）：CN10Y − CN2Y
+    cnTermSpreadBp: computeSpreadBp(cn10y.price, cn2y.price),
     gold,
     oil,
     csi300: { ...csi300, pe: peNow },
@@ -435,6 +503,9 @@ export async function fetchMacroData({ force = false, history = true } = {}) {
     oilYoyPct: null,
     usRealRate: null,
     equityBond: null,
+    // 经济数据（CPI/PPI/PMI）：当日缓存，失败为 null
+    economy: null,
+    economyMissing: true,
     // 降级标志（界面据此显示降级提示）
     quotesFailed,
     peMissing: !(peNow > 0),
@@ -463,10 +534,16 @@ export async function fetchMacroData({ force = false, history = true } = {}) {
     }
   }
 
+  // 经济数据（CPI/PPI/PMI）：月度数据，当日缓存；失败不阻断页面
+  const economy = await fetchEconomyData({ force });
+  data.economy = economy;
+  data.economyMissing = !economy;
+
   cache = { data, ts: Date.now() };
   return data;
 }
 
 export function clearMacroCache() {
   cache = null;
+  economyCache = null;
 }

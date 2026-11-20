@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, summarizeAttention } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -40,6 +40,62 @@ const HOLDINGS_FILTERS = [
   },
   { key: 'normal', label: '运行中', match: (m) => m.status === 'normal' }
 ];
+
+/** 今日关注卡折叠态（模块态，不持久化） */
+let attentionExpanded = false;
+
+export function toggleAttentionExpanded() {
+  attentionExpanded = !attentionExpanded;
+}
+
+const ATTENTION_CHIP_LABELS = {
+  stop: '止损',
+  trailing: '移动止盈',
+  takeProfit: '止盈',
+  add: '可补仓',
+  nearStop: '接近止损'
+};
+
+/** 今日关注汇总卡：无条目整卡不渲染；>3 条默认前 3 + 展开折叠 */
+function attentionCardHtml(metricsList) {
+  const { counts, items } = summarizeAttention(metricsList);
+  if (items.length === 0) return '';
+
+  const chips = Object.entries(ATTENTION_CHIP_LABELS)
+    .filter(([key]) => counts[key] > 0)
+    .map(([key, label]) => {
+      const meta = STATUS_META[key];
+      return `<span class="badge badge-${meta.tone} badge-mini">${label} ${counts[key]}</span>`;
+    })
+    .join('');
+
+  const shown = attentionExpanded || items.length <= 3 ? items : items.slice(0, 3);
+  const list = shown
+    .map(
+      (item) => `
+        <li class="attention-item">
+          <button class="attention-name" type="button" data-action="open-fund" data-id="${esc(item.fundId)}">${esc(item.name)}</button>
+          <span class="attention-text">${esc(item.text)}</span>
+        </li>`
+    )
+    .join('');
+
+  return `
+    <section class="card attention-card">
+      <div class="attention-head">
+        <h2>今日关注</h2>
+        <div class="attention-chips">${chips}</div>
+      </div>
+      <ul class="attention-list">${list}</ul>
+      ${
+        items.length > 3
+          ? `<button class="attention-toggle" type="button" data-action="toggle-attention">${
+              attentionExpanded ? '收起' : `展开全部 ${items.length} 条`
+            }</button>`
+          : ''
+      }
+    </section>`;
+}
 
 function badge(metrics) {
   const meta = statusMeta(metrics.status);
@@ -103,6 +159,7 @@ function fundCard(metrics, valuation = null) {
         <div class="fund-title">
           <h3>${esc(fund.name || fund.code)}</h3>
           <span class="fund-code">${esc(fund.code)}</span>
+          ${fund.ftype ? `<span class="fund-ftype">${esc(fund.ftype)}</span>` : ''}
           ${valuationBadge(valuation)}
         </div>
         ${badge(metrics)}
@@ -220,6 +277,7 @@ export function holdingsPage(state, metricsMap, { refreshing = false, filter = '
         <p class="hero-note">${metricsList.length} 只基金 · 净值更新 ${esc(updatedLabel)}</p>
       </section>
 
+      ${attentionCardHtml(metricsList)}
       ${filterBar}
       ${
         filteredList.length
@@ -817,17 +875,12 @@ export function macroPage(data, { refreshing = false } = {}) {
     if (bp <= 30) return { tone: 'ok', text: '国债曲线平坦，宽松预期占主导，债券偏友好，宜增配债券。' };
     return { tone: 'accent', text: '国债期限利差处于常规区间，股债维持现有比例即可。' };
   };
-  const dxyVerdict = (item) => {
-    if (!item || !Number.isFinite(item.changePct)) return null;
-    if (item.changePct >= 0.3) return { tone: 'warn', text: '美元短线走强，压制黄金与新兴市场权益，宜控制这两类敞口。' };
-    if (item.changePct <= -0.3) return { tone: 'ok', text: '美元短线走弱，利好黄金与新兴市场权益。' };
-    return { tone: 'accent', text: '美元指数平稳，对股金配置无新增方向信号。' };
-  };
-  const cnUsVerdict = (bp) => {
-    if (!Number.isFinite(bp)) return null;
-    return bp < 0
-      ? { tone: 'warn', text: '中美利差倒挂，跨境资金存在流出压力，权益资产风险偏好受限。' }
-      : { tone: 'ok', text: '中美利差为正，跨境资金环境友好，权益资产外部压力较小。' };
+  const economyVerdict = (eco) => {
+    if (!eco || !Number.isFinite(eco.pmi)) return null;
+    if (eco.pmi >= 51) return { tone: 'ok', text: `制造业景气扩张（PMI ${eco.pmi.toFixed(1)}），经济动能强，权益环境友好，宜维持或增配权益。` };
+    if (eco.pmi >= 50) return { tone: 'accent', text: `制造业处于扩张区间（PMI ${eco.pmi.toFixed(1)}），经济平稳，股债维持现有比例即可。` };
+    if (eco.pmi >= 49) return { tone: 'warn', text: `制造业回落至荣枯线下（PMI ${eco.pmi.toFixed(1)}），经济动能减弱，关注后续能否回升，暂不加仓。` };
+    return { tone: 'ok', text: `制造业景气收缩（PMI ${eco.pmi.toFixed(1)}），经济下行压力较大，债券偏友好，宜增配债券、控制权益仓位。` };
   };
 
   const quickDirCard = `
@@ -856,16 +909,16 @@ export function macroPage(data, { refreshing = false } = {}) {
     title: '股债性价比 · 权益 vs 债券',
     rows: eb
       ? [
-          { label: 'PE-TTM（计算因子）', value: data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—' },
+          { label: 'PE-TTM（近似·计算因子）', value: data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—' },
           { label: '盈利收益率 = 1 ÷ PE-TTM', value: fmtPctVal(eb.earningsYield) },
           { label: '股债收益比', value: eb.ratio.toFixed(2) },
           { label: '风险溢价 ERP', value: `${eb.erp >= 0 ? '+' : ''}${eb.erp.toFixed(2)}%` }
         ]
-      : [{ label: 'PE-TTM（计算因子）', value: data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—' }],
+      : [{ label: 'PE-TTM（近似·计算因子）', value: data.csi300.pe > 0 ? data.csi300.pe.toFixed(1) : '—' }],
     extra: eb ? percentileBarHtml(eb.ratioPercentile, '股债收益比 5 年分位') : '',
     v: equityBondVerdict(eb),
     note: eb
-      ? `盈利收益率 = 1 ÷ PE-TTM，采用当前盈利近似估算；分位基于近 5 年日频数据（样本 ${eb.sampleSize} 个）。`
+      ? `盈利收益率 = 1 ÷ PE-TTM，PE 取行情近似口径、盈利采用当前值近似估算；分位基于近 5 年日频数据（样本 ${eb.sampleSize} 个）。`
       : '历史序列暂不可用，请稍后刷新重试。'
   });
 
@@ -888,11 +941,11 @@ export function macroPage(data, { refreshing = false } = {}) {
     title: '美债期限利差 · 权益风险总敞口',
     rows: [
       { label: '美国10Y', value: fmtPctVal(data.us10y.price) },
-      { label: '美国5Y', value: fmtPctVal(data.us05y.price) },
-      { label: '10Y − 5Y 利差', value: fmtBp(data.usTermSpreadBp), cls: bpCls(data.usTermSpreadBp) }
+      { label: '美国2Y', value: fmtPctVal(data.us2y.price) },
+      { label: '10Y − 2Y 利差', value: fmtBp(data.usTermSpreadBp), cls: bpCls(data.usTermSpreadBp) }
     ],
     v: usSpreadVerdict(data.usTermSpreadBp),
-    note: '东财全球债市场无 2Y 品种，期限利差采用 10Y−5Y 口径。'
+    note: '美债期限利差采用 10Y−2Y 口径，短端对货币政策更敏感。'
   });
 
   // 4. 中国国债期限利差（债券友好度）
@@ -901,37 +954,33 @@ export function macroPage(data, { refreshing = false } = {}) {
     title: '中国期限利差 · 债券友好度',
     rows: [
       { label: '中国10Y', value: fmtPctVal(data.cn10y.price), change: chg(data.cn10y, '%').text, cls: chg(data.cn10y, '%').cls },
-      { label: '中国5Y', value: fmtPctVal(data.cn05y.price) },
-      { label: '10Y − 5Y 利差', value: fmtBp(data.cnTermSpreadBp), cls: bpCls(data.cnTermSpreadBp) }
+      { label: '中国2Y', value: fmtPctVal(data.cn2y.price) },
+      { label: '10Y − 2Y 利差', value: fmtBp(data.cnTermSpreadBp), cls: bpCls(data.cnTermSpreadBp) }
     ],
     v: cnSpreadVerdict(data.cnTermSpreadBp),
-    note: '东财全球债市场无 2Y 品种，期限利差采用 10Y−5Y 口径。'
+    note: '中债期限利差采用 10Y−2Y 口径，短端对资金面更敏感。'
   });
 
-  // 5. 美元指数（黄金与新兴权益）
-  const dx = chg(data.dxy, '%');
-  const cardDxy = card({
-    grad: 'grad-gold',
-    title: '美元指数 · 黄金与新兴权益',
-    rows: [{ label: '美元指数', value: data.dxy.price > 0 ? data.dxy.price.toFixed(2) : '—', change: dx.text, cls: dx.cls }],
-    v: dxyVerdict(data.dxy),
-    note: '美元与黄金、新兴市场权益大体负相关；日涨跌仅作短线参考。'
-  });
-
-  // 6. 中美10Y利差（跨境资金）
-  const cardCnUs = card({
+  // 5. 通胀与景气（经济周期锚：CPI/PPI/PMI）
+  const eco = data.economy;
+  const scissors = eco && Number.isFinite(eco.cpiYoy) && Number.isFinite(eco.ppiYoy) ? eco.ppiYoy - eco.cpiYoy : NaN;
+  const cardEconomy = card({
     grad: 'grad-teal',
-    title: '中美利差 · 跨境资金',
+    title: '通胀与景气 · 经济周期锚',
     rows: [
-      { label: '中国10Y', value: fmtPctVal(data.cn10y.price) },
-      { label: '美国10Y', value: fmtPctVal(data.us10y.price) },
-      { label: '中美10Y利差', value: fmtBp(data.cnUsSpreadBp), cls: bpCls(data.cnUsSpreadBp) }
+      { label: 'CPI 同比', value: fmtPctVal(eco ? eco.cpiYoy : NaN) },
+      { label: 'PPI 同比', value: fmtPctVal(eco ? eco.ppiYoy : NaN) },
+      { label: 'PPI−CPI 剪刀差', value: fmtPctVal(scissors), cls: Number.isFinite(scissors) ? (scissors >= 0 ? 'up' : 'down') : '' },
+      { label: '制造业 PMI', value: eco && Number.isFinite(eco.pmi) ? eco.pmi.toFixed(1) : '—' },
+      { label: '非制造业 PMI', value: eco && Number.isFinite(eco.pmiNonMfg) ? eco.pmiNonMfg.toFixed(1) : '—' }
     ],
-    v: cnUsVerdict(data.cnUsSpreadBp),
-    note: '中债企业债信用利差暂无免费公开数据源，以中美10年期国债利差作为跨境利差参考。'
+    v: economyVerdict(eco),
+    note: eco
+      ? `${eco.time}月度数据，每月 9 日前后更新；PMI 以 50 为荣枯线，剪刀差为正代表上游成本压力偏大。`
+      : '经济数据暂不可用，请稍后刷新重试。'
   });
 
-  // 7. 黄金价格（方向沿用实际利率锚）
+  // 6. 黄金价格（方向沿用实际利率锚；美元指数并入本卡展示）
   const gd = chg(data.gold, '%');
   const cardGold = card({
     grad: 'grad-gold',
@@ -945,7 +994,7 @@ export function macroPage(data, { refreshing = false } = {}) {
     note: '黄金与实际利率负相关、与美元大体反向；方向判断采用实际利率近似口径（详见实际利率卡）。'
   });
 
-  // 8. 石油价格（WTI 同比位置）
+  // 7. 石油价格（WTI 同比位置）
   const ol = chg(data.oil, '%');
   const oilYoy = data.oilYoyPct;
   const oilVerdict = !Number.isFinite(oilYoy)
@@ -979,6 +1028,7 @@ export function macroPage(data, { refreshing = false } = {}) {
   if (data.proxyUsed) degradedNotes.push('黄金/原油/沪深300 为天天基金估值代理，仅日涨跌可用');
   if (data.peMissing) degradedNotes.push('沪深300 PE 暂不可用，股债性价比降级');
   if (data.historyMissing) degradedNotes.push('历史序列暂不可用，分位/同比/实际利率降级');
+  if (data.economyMissing) degradedNotes.push('CPI/PPI/PMI 经济数据暂不可用');
   const degradedHtml = degradedNotes.length
     ? `<p class="macro-note t-warn">⚠ 降级模式：${esc(degradedNotes.join('；'))}。</p>`
     : '';
@@ -991,8 +1041,7 @@ export function macroPage(data, { refreshing = false } = {}) {
       ${cardReal}
       ${cardUsSpread}
       ${cardCnSpread}
-      ${cardDxy}
-      ${cardCnUs}
+      ${cardEconomy}
       ${cardGold}
       ${cardOil}
       ${degradedHtml}

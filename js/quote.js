@@ -3,7 +3,7 @@
  * 接口不可用时由界面降级为手动录入。
  */
 const ENDPOINT = 'https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo';
-const HIS_NET_ENDPOINT = 'https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList';
+const BASIC_INFO_ENDPOINT = 'https://fundmobapi.eastmoney.com/FundMNewApi/FundMNBasicInformation';
 const TIMEOUT_MS = 10000;
 
 export function isFundCode(code) {
@@ -65,18 +65,19 @@ export async function fetchQuotes(codes, { timeout = TIMEOUT_MS } = {}) {
 }
 
 /**
- * 拉取单只基金近一年（约 260 条）单位净值历史，用于估值水平分位。
- * 返回 [{ date: 'YYYY-MM-DD', nav: Number }]（按日期倒序，接口原始顺序），失败返回 null。
- * 历史仅存内存缓存（app.js 层），禁止写入 localStorage。
+ * F10 基本信息：基金类型（FTYPE）与跟踪指数（INDEXCODE / INDEXNAME / INDEXTEXCH）。
+ * 用于估值标签分流：
+ * - FTYPE 以「指数型-股票」开头且 INDEXCODE 为 6 位数字、INDEXTEXCH ∈ {0,1} → 跟踪指数 K 线分位
+ * - FTYPE「指数型-其他」且 INDEXCODE=AU9999 → 黄金价格分位
+ * - FTYPE 含「债券」→ 中债10Y收益率分位取反
+ * - 主动/行业/QDII 基金 → 不展示估值标签
+ * 失败返回 null（静默降级：不显示标签，缓存期内不重试）。
  */
-export async function fetchValuationHistory(code, { timeout = TIMEOUT_MS, pageSize = 260 } = {}) {
+export async function fetchFundBasicInfo(code, { timeout = TIMEOUT_MS } = {}) {
   if (!isFundCode(code)) return null;
 
   const query = new URLSearchParams({
     FCODE: String(code).trim(),
-    PLEVEL: '1',
-    pageIndex: '1',
-    pageSize: String(pageSize),
     deviceid: 'Wap',
     plat: 'Wap',
     product: 'EFund',
@@ -87,7 +88,7 @@ export async function fetchValuationHistory(code, { timeout = TIMEOUT_MS, pageSi
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch(`${HIS_NET_ENDPOINT}?${query.toString()}`, {
+    const response = await fetch(`${BASIC_INFO_ENDPOINT}?${query.toString()}`, {
       signal: controller.signal,
       cache: 'no-store',
       headers: { Accept: 'application/json' }
@@ -95,13 +96,16 @@ export async function fetchValuationHistory(code, { timeout = TIMEOUT_MS, pageSi
     if (!response.ok) return null;
 
     const payload = await response.json();
-    const rows = Array.isArray(payload && payload.Datas) ? payload.Datas : [];
-    const list = rows
-      .map((row) => ({ date: String((row && row.FSRQ) || ''), nav: Number(row && row.DWJZ) }))
-      .filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item.date) && Number.isFinite(item.nav) && item.nav > 0);
-    return list.length > 0 ? list : null;
+    const data = payload && payload.Datas;
+    if (!data) return null;
+    return {
+      ftype: String(data.FTYPE || ''),
+      indexCode: String(data.INDEXCODE || ''),
+      indexName: String(data.INDEXNAME || ''),
+      indexExchange: String(data.INDEXTEXCH || '')
+    };
   } catch {
-    return null; // 失败静默降级：不显示估值标签，也不重试
+    return null;
   } finally {
     clearTimeout(timer);
   }

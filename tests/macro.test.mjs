@@ -52,7 +52,7 @@ function assert(name, cond, detail = '') {
   assert('序列太短返回 null', computeEquityBond([{ date: 'a', close: 1 }], new Map([['a', 2]]), 10, 100) === null);
 }
 
-import { computeSpreadBp, computeOilYoy, computeRealRate } from '../js/macro.js';
+import { computeSpreadBp, computeOilYoy, computeRealRate, extractLatestEconomy } from '../js/macro.js';
 
 // computeSpreadBp 期限利差
 {
@@ -79,7 +79,9 @@ import { computeSpreadBp, computeOilYoy, computeRealRate } from '../js/macro.js'
   assert('WTI 同比：负收益约 −20%', Math.abs(yoy2 - -20) < 1e-6, `got ${yoy2}`);
 
   // 边界：样本不足 / 非法收盘价
-  assert('WTI 同比：样本不足返回 null', computeOilYoy(series.slice(0, 200)) === null);
+  assert('WTI 同比：样本不足返回 null', computeOilYoy(series.slice(0, 240)) === null);
+  // 真实口径：一年自然日窗口约 250-290 条交易日样本，280 条应可计算
+  assert('WTI 同比：280 条交易日样本可正常计算', computeOilYoy(series.slice(120)) !== null);
   assert('WTI 同比：空序列返回 null', computeOilYoy([]) === null);
   // 非法收盘价点被过滤：剩余有效样本仍足够时正常计算
   const withStray = series.map((p, i) => (i === 30 ? { ...p, close: 0 } : p));
@@ -93,6 +95,32 @@ import { computeSpreadBp, computeOilYoy, computeRealRate } from '../js/macro.js'
   assert('实际利率：通胀高于名义 → 负值', Math.abs(computeRealRate(3.0, 5.5) - -2.5) < 1e-9);
   assert('实际利率：油价数据缺失返回 null', computeRealRate(4.5, null) === null);
   assert('实际利率：收益率缺失返回 null', computeRealRate(NaN, 2.5) === null);
+}
+
+// extractLatestEconomy 经济数据提取（CPI/PPI/PMI）
+{
+  const cpiRows = [
+    { TIME: '2026年10月份', NATIONAL_SAME: 0.7, NATIONAL_SEQUENTIAL: 0 },
+    { TIME: '2026年9月份', NATIONAL_SAME: 0.5 }
+  ];
+  const ppiRows = [{ TIME: '2026年10月份', BASE_SAME: 5.7, BASE: 105.7 }];
+  const pmiRows = [{ TIME: '2026年10月份', MAKE_INDEX: 49.3, NMAKE_INDEX: 49.7 }];
+  const eco = extractLatestEconomy(cpiRows, ppiRows, pmiRows);
+  assert('经济数据：取各指标最新有效值', eco && eco.cpiYoy === 0.7 && eco.ppiYoy === 5.7 && eco.pmi === 49.3 && eco.pmiNonMfg === 49.7);
+  assert('经济数据：time 去掉「份」字', eco.time === '2026年10月');
+
+  // 首行字段非法时向下兼容取次行
+  const cpiWithBad = [{ TIME: '2026年10月份', NATIONAL_SAME: '-' }, ...cpiRows];
+  const eco2 = extractLatestEconomy(cpiWithBad, [], []);
+  assert('经济数据：首行非法时取次行有效值', eco2 && eco2.cpiYoy === 0.7);
+
+  // 部分指标缺失：其余仍正常返回
+  const eco3 = extractLatestEconomy(cpiRows, [], []);
+  assert('经济数据：PPI/PMI 缺失时返回 null 字段', eco3 && eco3.cpiYoy === 0.7 && eco3.ppiYoy === null && eco3.pmi === null);
+
+  // 全部缺失 → null
+  assert('经济数据：全空输入返回 null', extractLatestEconomy([], [], []) === null);
+  assert('经济数据：null 输入返回 null', extractLatestEconomy(null, null, null) === null);
 }
 
 console.log(`\n${passed} 通过，${failed} 失败`);
