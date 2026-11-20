@@ -3,6 +3,7 @@ import {
   DEFAULT_STRATEGY,
   DEFAULT_ASSET_TARGETS,
   STRATEGY_PRESETS,
+  backtestStrategy,
   classifyAssetClass,
   computeFundMetrics,
   computePosition,
@@ -492,6 +493,111 @@ test('关注聚合：normal/none 不产条目；空列表全零；名称缺失�
   const noName = summarizeAttention([{ fund: { id: 'f9', code: '888888' }, status: 'stop' }]);
   assert.equal(noName.items[0].name, '888888');
   assert.equal(summarizeAttention(null).items.length, 0);
+});
+
+// ===== 策略回测 backtestStrategy =====
+
+function navSeries(values) {
+  return values.map((nav, i) => ({
+    date: `2026-01-${String(i + 1).padStart(2, '0')}`,
+    nav
+  }));
+}
+
+function closeTo(actual, expected, tol = 0.01, label = '') {
+  assert.ok(
+    Math.abs(actual - expected) <= tol,
+    `${label}: 期望 ${expected}±${tol}，实际 ${actual}`
+  );
+}
+
+test('回测：样本不足 20 天 → ok:false', () => {
+  const result = backtestStrategy(navSeries(Array.from({ length: 10 }, () => 1)), 'NORMAL');
+  assert.equal(result.ok, false);
+  assert.ok(result.reason.includes('样本不足'));
+});
+
+test('回测：单日急跌破止损线 → 清仓离场，无补仓（补仓只在持仓时执行）', () => {
+  // 首日 1.0 全仓买入 10000 元 = 10000 份；次日 0.85 ≤ 止损线 0.88 → 按 0.85 清仓
+  const values = [1.0, 0.85];
+  while (values.length < 20) values.push(0.85);
+  const result = backtestStrategy(navSeries(values), 'NORMAL');
+  assert.equal(result.ok, true);
+  assert.equal(result.counts.stopLoss, 1);
+  assert.equal(result.counts.addBuys, 0);
+  assert.equal(result.counts.takeProfit, 0);
+  assert.equal(result.counts.trailing, 0);
+  closeTo(result.finalCash, 8500, 0.01, 'finalCash');
+  closeTo(result.finalMarketValue, 0, 0.01, 'finalMarketValue');
+  closeTo(result.totalReturnPct, -15, 0.01, 'totalReturnPct');
+  closeTo(result.buyHoldReturnPct, -15, 0.01, 'buyHoldReturnPct');
+  closeTo(result.maxDrawdownPct, 15, 0.01, 'maxDrawdownPct');
+});
+
+test('回测：单边上涨 → 首次达止盈线卖出 40%，峰值回撤未达不触发移动止盈', () => {
+  // 1.0 起步每日 +0.02：day10 nav=1.2 触发止盈卖 4000 份×1.2=4800 元，剩 6000 份；末值 1.38
+  const values = Array.from({ length: 20 }, (_, i) => 1.0 + 0.02 * i);
+  const result = backtestStrategy(navSeries(values), 'NORMAL');
+  assert.equal(result.counts.takeProfit, 1);
+  assert.equal(result.counts.trailing, 0);
+  assert.equal(result.counts.addBuys, 0);
+  closeTo(result.finalCash, 4800, 0.01, 'finalCash');
+  closeTo(result.finalMarketValue, 6000 * 1.38, 0.01, 'finalMarketValue');
+  closeTo(result.totalReturnPct, 30.8, 0.01, 'totalReturnPct'); // (8280+4800−10000)/10000
+  closeTo(result.buyHoldReturnPct, 38, 0.01, 'buyHoldReturnPct');
+  closeTo(result.maxDrawdownPct, 0, 0.01, 'maxDrawdownPct');
+});
+
+test('回测：先跌 5%/10% 再反弹 → 两档补仓、成本摊低、收益跑赢买入持有', () => {
+  const values = [
+    1.0, 0.98, 0.95, 0.92, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9,
+    0.92, 0.95, 0.98, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+  ];
+  const result = backtestStrategy(navSeries(values), 'NORMAL');
+  assert.equal(result.counts.addBuys, 2);
+  assert.equal(result.counts.stopLoss, 0);
+  closeTo(result.addTotalAmount, 3200, 0.01, 'addTotalAmount');
+  // 摊薄成本 = 13200 / (10000 + 1200/0.95 + 2000/0.9) ≈ 0.97884
+  closeTo(result.finalAvgCost, 13200 / (10000 + 1200 / 0.95 + 2000 / 0.9), 1e-6, 'finalAvgCost');
+  closeTo(result.totalInvested, 13200, 0.01, 'totalInvested');
+  assert.ok(result.totalReturnPct > 0, `反弹回本后应盈利，实际 ${result.totalReturnPct}`);
+  assert.ok(result.totalReturnPct > result.buyHoldReturnPct, '补仓摊低后应跑赢买入持有（0%）');
+});
+
+test('回测：缓幅震荡无信号 → 策略收益 ≈ 买入持有，触发次数全零', () => {
+  const values = Array.from({ length: 20 }, (_, i) => 1.0 + 0.002 * i); // 缓涨至 1.038
+  const result = backtestStrategy(navSeries(values), 'NORMAL');
+  assert.deepEqual(result.counts, { stopLoss: 0, takeProfit: 0, trailing: 0, addBuys: 0 });
+  closeTo(result.totalReturnPct, result.buyHoldReturnPct, 0.01, 'totalReturnPct vs buyHold');
+});
+
+test('回测：逐日缓跌至 0.8784 → 5%/10% 两档补仓后成本换锚，止损线降至未触发', () => {
+  const values = Array.from({ length: 20 }, (_, i) => 1.0 - 0.0064 * i); // 末值 0.8784
+  const result = backtestStrategy(navSeries(values), 'NORMAL');
+  assert.equal(result.counts.addBuys, 2);
+  assert.equal(result.counts.stopLoss, 0);
+  closeTo(result.addTotalAmount, 3200, 0.01, 'addTotalAmount');
+  // 5% 档首日 nav=0.9488（day8）、10% 档首日 nav=0.8976（day16）
+  // 期末市值 = (10000 + 1200/0.9488 + 2000/0.8976) × 0.8784
+  closeTo(
+    result.finalMarketValue,
+    (10000 + 1200 / 0.9488 + 2000 / 0.8976) * 0.8784,
+    0.01,
+    'finalMarketValue'
+  );
+});
+
+test('回测：非法策略 key 兜底普通方案；脏数据（null/负值/格式错）被过滤', () => {
+  const values = Array.from({ length: 23 }, (_, i) => 1.0 + 0.002 * i);
+  const series = navSeries(values);
+  series[3] = null;
+  series[5] = { date: 'bad-date', nav: 1.0 };
+  series[7] = { date: '2026-01-08', nav: -1 };
+  const r1 = backtestStrategy(series, 'BOGUS_KEY');
+  assert.equal(r1.ok, true);
+  assert.equal(r1.sampleSize, 20); // 23 − 3 条脏数据
+  const r2 = backtestStrategy([null, { date: 'x', nav: 0 }], 'NORMAL');
+  assert.equal(r2.ok, false);
 });
 
 // ===== 估值水平 computeValuationLevel（通用序列分位 + 分级 + 债券取反） =====

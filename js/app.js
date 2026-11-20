@@ -1,5 +1,6 @@
 import * as store from './store.js';
 import {
+  backtestStrategy,
   classifyAssetClass,
   computeFundMetrics,
   computeValuationLevel,
@@ -979,6 +980,18 @@ document.addEventListener('click', (event) => {
       views.toggleAttentionExpanded();
       render();
       break;
+    case 'run-backtest': {
+      const fundSelect = document.querySelector('select[name="backtestFund"]');
+      const keySelect = document.querySelector('select[name="backtestKey"]');
+      const fund = getFund(fundSelect && fundSelect.value);
+      views.setBacktestResult(
+        fund
+          ? backtestStrategy(fund.navHistory, keySelect ? keySelect.value : null)
+          : { ok: false, reason: '未找到基金，请重新选择' }
+      );
+      render();
+      break;
+    }
     case 'lookup-fund':
       lookupFund(target);
       break;

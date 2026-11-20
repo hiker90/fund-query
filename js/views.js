@@ -618,6 +618,71 @@ function field({
     </label>`;
 }
 
+/** 策略回测卡模块态（不持久化）：选中的基金 / 方案 / 最近一次结果 */
+let backtestFundId = '';
+let backtestResult = null;
+
+export function setBacktestResult(result) {
+  backtestResult = result;
+}
+
+function backtestResultHtml(result) {
+  if (!result || !result.ok) {
+    return `<p class="card-empty">${esc((result && result.reason) || '选择基金与方案后点击运行。')}</p>`;
+  }
+  const c = result.counts;
+  const rows = [
+    ['区间总收益', `${fmtPct(result.totalReturnPct)}<small>（买入持有 ${fmtPct(result.buyHoldReturnPct)}）</small>`],
+    ['最大回撤', fmtPct(result.maxDrawdownPct)],
+    ['投入 → 期末', `¥ ${fmtMoney(result.totalInvested, 0)} → ¥ ${fmtMoney(result.finalMarketValue + result.finalCash, 0)}`],
+    ['触发次数', `止损 ${c.stopLoss} · 止盈 ${c.takeProfit} · 移动止盈 ${c.trailing} · 补仓 ${c.addBuys}（合计 ¥ ${fmtMoney(result.addTotalAmount, 0)}）`]
+  ];
+  return `
+    <ul class="preset-list">
+      ${rows
+        .map(([label, value]) => `<li><span>${label}</span><b>${value}</b></li>`)
+        .join('')}
+    </ul>
+    <p class="card-empty">样本 ${result.sampleSize} 天（${esc(result.startDate.slice(5))} ~ ${esc(result.endDate.slice(5))}），模拟按预设规则自动执行，仅供参考。</p>`;
+}
+
+/** 策略页「策略回测」卡：限有净值历史的基金 */
+function backtestCardHtml(funds) {
+  const eligible = (funds || []).filter((f) => Array.isArray(f.navHistory) && f.navHistory.length >= 5);
+  if (eligible.length === 0) {
+    return `
+      <section class="card notes">
+        <h2 class="card-title">策略回测</h2>
+        <p class="card-empty">暂无基金有净值历史（进入持仓页刷新净值后积累，≥5 条可选）。</p>
+      </section>`;
+  }
+  if (!backtestFundId || !eligible.some((f) => f.id === backtestFundId)) {
+    backtestFundId = eligible[0].id;
+  }
+  const options = eligible
+    .map(
+      (f) =>
+        `<option value="${esc(f.id)}" ${f.id === backtestFundId ? 'selected' : ''}>${esc(f.name || f.code)}</option>`
+    )
+    .join('');
+  const keyOptions = ['NORMAL', 'AGGRESSIVE']
+    .map(
+      (key) =>
+        `<option value="${key}" ${key === 'NORMAL' ? 'selected' : ''}>${key === 'AGGRESSIVE' ? '激进方案' : '普通方案'}</option>`
+    )
+    .join('');
+  return `
+    <section class="card notes">
+      <h2 class="card-title">策略回测</h2>
+      <div class="backtest-controls">
+        <select name="backtestFund" aria-label="回测基金">${options}</select>
+        <select name="backtestKey" aria-label="回测方案">${keyOptions}</select>
+        <button class="btn secondary" type="button" data-action="run-backtest">运行回测</button>
+      </div>
+      <div id="backtest-result">${backtestResultHtml(backtestResult)}</div>
+    </section>`;
+}
+
 export function strategyPage(state) {
   const currentKey = state.settings.defaultStrategy === 'AGGRESSIVE' ? 'AGGRESSIVE' : 'NORMAL';
   const presetCards = Object.keys(STRATEGY_PRESETS)
@@ -638,6 +703,8 @@ export function strategyPage(state) {
         ${presetCards}
         <button class="btn primary block" type="submit">保存默认方案</button>
       </form>
+
+      ${backtestCardHtml(state.funds || [])}
 
       <section class="card notes">
         <h2 class="card-title">策略说明</h2>

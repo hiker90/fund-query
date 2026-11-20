@@ -561,6 +561,13 @@ a {
   color: var(--accent);
 }
 
+.backtest-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 12px 0;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;

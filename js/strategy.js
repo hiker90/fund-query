@@ -712,3 +712,118 @@ export function parseBatchText(text) {
 
   return { rows: [...byCode.values()], errors };
 }
+
+/**
+ * 策略回测：用基金本地净值快照（[{date,nav}]，升序）回放预设策略自动执行效果。
+ * 回放口径（与 computeFundMetrics 对齐）：
+ * - 首日按收盘净值全仓买入 initialAmount（底仓语义，tierAnchor = 首日买入价）
+ * - 逐日按 trailing > stop > takeProfit > add 链序处理：
+ *   移动止盈（armed 且回撤达标 → 清余仓离场）；止损（清仓离场）；
+ *   止盈（每周期按 takeProfitSellRatio% 卖份额，净值回落至止盈线下方重置）；
+ *   补仓（未执行档位 nav ≤ anchor×(1−dropPct) → 买入 tier.amount，成本换锚）
+ * - maxDrawdown 基于「市值+现金」账户总权益曲线
+ * 有效样本（nav>0）< 20 → { ok:false, reason }；纯函数，脏数据过滤不抛错。
+ */
+export function backtestStrategy(navHistory, strategyKey, initialAmount = 10000) {
+  const strategy = resolveStrategyByKey(strategyKey, null) || STRATEGY_PRESETS.NORMAL;
+  const series = (Array.isArray(navHistory) ? navHistory : [])
+    .map((p) => ({ date: String((p && p.date) || ''), nav: Number(p && p.nav) }))
+    .filter((p) => /^\d{4}-\d{2}-\d{2}$/.test(p.date) && Number.isFinite(p.nav) && p.nav > 0);
+  if (series.length < 20) {
+    return { ok: false, reason: '净值样本不足 20 天，暂无法回测' };
+  }
+
+  const firstNav = series[0].nav;
+  let shares = initialAmount / firstNav;
+  let cash = 0;
+  let invested = initialAmount;
+  let tierAnchor = firstNav;
+  let avgCost = firstNav;
+  let peak = firstNav;
+  let peakEquity = initialAmount;
+  let takeProfitSold = false;
+  let closed = false; // 止损/移动止盈清仓后不再交易
+  const tierState = (strategy.addTiers || []).map(() => false);
+  const counts = { stopLoss: 0, takeProfit: 0, trailing: 0, addBuys: 0 };
+  let addTotalAmount = 0;
+  let maxDrawdownPct = 0;
+
+  const stopLossNav = () => avgCost * (1 - strategy.stopLossPct / 100);
+  const takeProfitNav = () => avgCost * (1 + strategy.takeProfitPct / 100);
+
+  for (let i = 1; i < series.length; i++) {
+    const { nav } = series[i];
+
+    if (!closed && shares > EPS) {
+      // 移动止盈：峰值达到止盈线后，回撤达标清余仓
+      const armed = peak >= takeProfitNav() - EPS;
+      const trailingNav = peak * (1 - strategy.trailingStopPct / 100);
+      if (armed && nav <= trailingNav + EPS) {
+        cash += shares * nav;
+        counts.trailing += 1;
+        shares = 0;
+        closed = true;
+      } else if (nav <= stopLossNav() + EPS) {
+        // 止损：一次性清仓
+        cash += shares * nav;
+        counts.stopLoss += 1;
+        shares = 0;
+        closed = true;
+      } else if (nav >= takeProfitNav() - EPS && !takeProfitSold) {
+        // 止盈：按预设比例卖出份额，成本按平均成本结转
+        const sellShares = shares * (strategy.takeProfitSellRatio / 100);
+        cash += sellShares * nav;
+        shares -= sellShares;
+        counts.takeProfit += 1;
+        takeProfitSold = true;
+      }
+    }
+
+    // 补仓：仅在持仓状态下执行（清仓后不再买回）
+    if (!closed && shares > EPS) {
+      (strategy.addTiers || []).forEach((tier, index) => {
+        if (tierState[index]) return;
+        const triggerNav = tierAnchor * (1 - tier.dropPct / 100);
+        if (nav <= triggerNav + EPS) {
+          tierState[index] = true;
+          const buyShares = tier.amount / nav;
+          avgCost = (avgCost * shares + tier.amount) / (shares + buyShares);
+          shares += buyShares;
+          invested += tier.amount;
+          addTotalAmount += tier.amount;
+          counts.addBuys += 1;
+        }
+      });
+    }
+
+    if (!closed && shares > EPS) peak = Math.max(peak, nav);
+    // 止盈周期重置：净值回落至止盈线下方后才允许下一轮止盈（当日触发不算）
+    if (nav < takeProfitNav() - EPS) takeProfitSold = false;
+
+    // 账户总权益回撤
+    const equity = shares * nav + cash;
+    peakEquity = Math.max(peakEquity, equity);
+    if (peakEquity > EPS) {
+      maxDrawdownPct = Math.max(maxDrawdownPct, ((peakEquity - equity) / peakEquity) * 100);
+    }
+  }
+
+  const lastNav = series[series.length - 1].nav;
+  const finalMarketValue = shares * lastNav;
+  return {
+    ok: true,
+    sampleSize: series.length,
+    startDate: series[0].date,
+    endDate: series[series.length - 1].date,
+    initialAmount,
+    totalInvested: invested,
+    finalMarketValue,
+    finalCash: cash,
+    finalAvgCost: shares > EPS ? avgCost : 0,
+    totalReturnPct: ((finalMarketValue + cash - invested) / invested) * 100,
+    buyHoldReturnPct: (lastNav / firstNav - 1) * 100,
+    maxDrawdownPct,
+    counts,
+    addTotalAmount
+  };
+}
