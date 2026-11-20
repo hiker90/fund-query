@@ -53,21 +53,18 @@ const BOND_YIELD_SECID = '171.CN10Y';
 const GOLD_PRICE_SECID = '101.GC00Y';
 
 /**
- * F10 基金类型自动归类三资产：
- * - fund.ftype 始终更新为 FTYPE 原值（持仓卡片展示用）
- * - assetClassAuto !== false（未手动改过大类）时按 classifyAssetClass 自动归入 EQUITY/BOND/GOLD
+ * F10 基金类型自动归类三资产（v1.17 起完全自动，无手动指定）：
+ * fund.ftype 始终更新为 FTYPE 原值，assetClass 恒按 classifyAssetClass 归类。
  * 返回是否有字段变化（需要持久化）。
  */
 function applyFundClassification(fund, info) {
   if (!info || !info.ftype) return false;
   let changed = fund.ftype !== info.ftype;
   fund.ftype = info.ftype;
-  if (fund.assetClassAuto !== false) {
-    const derived = classifyAssetClass(info.ftype, info.indexCode);
-    if (derived !== fund.assetClass) {
-      fund.assetClass = derived;
-      changed = true;
-    }
+  const derived = classifyAssetClass(info.ftype, info.indexCode);
+  if (derived !== fund.assetClass) {
+    fund.assetClass = derived;
+    changed = true;
   }
   return changed;
 }
@@ -431,7 +428,6 @@ async function confirmBatchImport() {
         name: (quote && quote.name) || `基金 ${row.code}`,
         category: '',
         assetClass: 'EQUITY',
-        assetClassAuto: true,
         nav,
         navDate: nav > 0 ? navDate : '',
         navUpdatedAt: nav > 0 ? Date.now() : 0,
@@ -527,9 +523,6 @@ function handleAddFund(form) {
 
   const name = String(form.elements.name.value || '').trim() || `基金 ${code}`;
   const category = String(form.elements.category?.value || '').trim();
-  const assetClass = ['EQUITY', 'BOND', 'GOLD'].includes(form.elements.assetClass?.value)
-    ? form.elements.assetClass.value
-    : 'EQUITY';
   const enteredNav = num(form.elements.nav.value);
   const navDateInput = form.elements.navDate.value || todayISO();
   const buyDate = form.elements.buyDate.value || navDateInput;
@@ -589,9 +582,7 @@ function handleAddFund(form) {
     code,
     name,
     category,
-    assetClass,
-    // 显式选择债券/黄金 → 视为手动指定，自动归类不再覆盖；默认权益 → 跟随 FTYPE 自动归类
-    assetClassAuto: assetClass === 'EQUITY',
+    assetClass: 'EQUITY', // 添加后由 F10 FTYPE 自动归类（异步）
     nav,
     navDate: nav > 0 ? navDate : '',
     navUpdatedAt: nav > 0 ? Date.now() : 0,
@@ -626,7 +617,7 @@ function handleAddFund(form) {
   toast('已加入监控', 'success');
   if (parseRoute().name !== 'holdings') location.hash = '#/holdings';
 
-  // 异步拉取 F10 基金类型：FTYPE 原值 + 自动归类三资产（表单里显式选了债券/黄金则视为手动指定）
+  // 异步拉取 F10 基金类型：FTYPE 原值 + 自动归类三资产
   fetchFundBasicInfo(fund.code)
     .then((info) => {
       if (!applyFundClassification(fund, info)) return;
@@ -1248,20 +1239,6 @@ document.addEventListener('change', (event) => {
     if (fund) {
       fund.category = String(assignSelect.value || '').trim();
       commit();
-    }
-    return;
-  }
-
-  // 修改基金资产大类（权益/债券/黄金）：手动指定后关闭自动归类
-  const classSelect = event.target.closest('[data-action="change-fund-class"]');
-  if (classSelect) {
-    const fund = getFund(classSelect.dataset.fund);
-    const value = String(classSelect.value || '');
-    if (fund && ['EQUITY', 'BOND', 'GOLD'].includes(value)) {
-      fund.assetClass = value;
-      fund.assetClassAuto = false;
-      commit();
-      toast(`已将「${fund.name}」归入${value === 'EQUITY' ? '权益' : value === 'BOND' ? '债券' : '黄金'}大类`);
     }
     return;
   }

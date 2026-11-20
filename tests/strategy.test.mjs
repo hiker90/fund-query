@@ -426,7 +426,60 @@ test('自动归类：FTYPE 原值与 ftype 缺省兼容（normalizeState 补齐�
     funds: [{ code: '000961', name: 'x', nav: 1 }]
   });
   assert.equal(legacy.funds[0].ftype, '');
-  assert.equal(legacy.funds[0].assetClassAuto, true);
+  assert.equal(legacy.funds[0].assetClass, 'EQUITY');
+  assert.equal('assetClassAuto' in legacy.funds[0], false); // v4 起删除该字段
+});
+
+// ===== 手动大类取消：v3→v4 迁移（sanitizeFund 幂等重推导） =====
+
+test('迁移 v4：手动标记不保留，FTYPE 完全决定大类', () => {
+  const migrated = normalizeState({
+    version: 3,
+    funds: [
+      { code: '110027', assetClassAuto: false, assetClass: 'BOND', ftype: '债券型-混合二级' },
+      { code: '000217', assetClass: 'BOND', ftype: '指数型-其他' } // 错标债券 → 回正 EQUITY
+    ]
+  });
+  assert.equal('assetClassAuto' in migrated.funds[0], false);
+  assert.equal(migrated.funds[0].assetClass, 'BOND');
+  assert.equal(migrated.funds[1].assetClass, 'EQUITY');
+});
+
+test('迁移 v4：原 GOLD 大类保留（防 AU9999 类无 indexCode 打回）', () => {
+  const migrated = normalizeState({
+    version: 3,
+    funds: [{ code: '002207', assetClass: 'GOLD', ftype: '指数型-其他' }]
+  });
+  assert.equal(migrated.funds[0].assetClass, 'GOLD');
+  // 幂等：重复迁移结果一致
+  const again = normalizeState(migrated);
+  assert.deepEqual(again.funds[0], migrated.funds[0]);
+});
+
+test('迁移 v4：FTYPE 含黄金/债券优先于原大类', () => {
+  const migrated = normalizeState({
+    version: 3,
+    funds: [
+      { code: '000217', assetClass: 'EQUITY', ftype: 'ETF联接-黄金' },
+      { code: '110027', assetClass: 'EQUITY', ftype: '混合债券型二级' }
+    ]
+  });
+  assert.equal(migrated.funds[0].assetClass, 'GOLD');
+  assert.equal(migrated.funds[1].assetClass, 'BOND');
+});
+
+test('迁移 v4：VERSION === 4 且幂等（同一数据重复迁移 deepEqual）', () => {
+  assert.equal(VERSION, 4);
+  const raw = {
+    version: 3,
+    funds: [
+      { code: '000961', name: 'x', nav: 1.2, assetClass: 'BOND', ftype: '指数型-股票' },
+      { code: '110022', name: 'y', nav: 2.1 }
+    ]
+  };
+  const first = normalizeState(raw);
+  const second = normalizeState(first);
+  assert.deepEqual(second, first);
 });
 
 // ===== 今日关注聚合 summarizeAttention =====

@@ -1,12 +1,13 @@
 import {
   DEFAULT_ASSET_TARGETS,
   STRATEGY_KEYS,
+  classifyAssetClass,
   num,
   strategyKeyFromLegacy
 } from './strategy.js';
 
 const STORAGE_KEY = 'fundpilot.v1';
-export const VERSION = 3;
+export const VERSION = 4;
 
 export function uid() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -84,6 +85,18 @@ function sanitizeFund(fund) {
     strategyOverride = strategyKeyFromLegacy(rawOverride);
   }
 
+  // 资产大类完全由 FTYPE 自动归类（v4 起取消手动指定）：
+  // 1. ftype 含「债券」→ BOND；2. ftype 含「黄金」→ GOLD；
+  // 3. 原大类为 GOLD 保留（防「指数型-其他」靠 INDEXCODE=AU9999 归类的黄金基金迁移时被打回）；
+  // 4. 其余按 classifyAssetClass(ftype)（缺省 EQUITY；手动错标 BOND 的基金会被回正为 EQUITY）
+  let assetClass;
+  const rawClass = ASSET_CLASS_KEYS.includes(fund.assetClass) ? fund.assetClass : 'EQUITY';
+  const ftype = typeof fund.ftype === 'string' ? fund.ftype.trim() : '';
+  if (ftype.includes('债券')) assetClass = 'BOND';
+  else if (ftype.includes('黄金')) assetClass = 'GOLD';
+  else if (rawClass === 'GOLD') assetClass = 'GOLD';
+  else assetClass = classifyAssetClass(ftype);
+
   return {
     id: typeof fund.id === 'string' && fund.id ? fund.id : uid(),
     code: String(fund.code || '').trim(),
@@ -93,9 +106,8 @@ function sanitizeFund(fund) {
     navUpdatedAt: num(fund.navUpdatedAt),
     navHistory,
     category: typeof fund.category === 'string' ? fund.category.trim() : '',
-    assetClass: ASSET_CLASS_KEYS.includes(fund.assetClass) ? fund.assetClass : 'EQUITY',
-    ftype: typeof fund.ftype === 'string' ? fund.ftype.trim() : '',
-    assetClassAuto: fund.assetClassAuto !== false,
+    assetClass,
+    ftype,
     strategyOverride,
     trades,
     tierState: Array.isArray(fund.tierState) ? fund.tierState.map(Boolean) : [],

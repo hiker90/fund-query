@@ -1232,13 +1232,6 @@ export function addFundSheetBody(categories = []) {
         ${field({ label: '净值日期', name: 'navDate', value: today, type: 'date', inputmode: 'none' })}
       </div>
       ${catSelect}
-      <label class="field">
-        <span>资产大类</span>
-        <select name="assetClass">
-          ${ASSET_CLASSES.map((c) => `<option value="${c.key}"${c.key === 'EQUITY' ? ' selected' : ''}>${esc(c.label)}</option>`).join('')}
-        </select>
-        <small>权益 / 债券 / 黄金，用于「三资产再平衡」统计，默认权益</small>
-      </label>
 
       <h3 class="form-section">初始底仓（可跳过）</h3>
       <div class="segmented" data-toggle="base-mode">
@@ -1599,9 +1592,6 @@ export function allocationPage(state, metricsMap, expandedCats = new Set(), macr
         <div class="asset-fund-item">
           <span>${esc(fmtFundName(f.fund))}</span>
           <b class="num">${fmtMoney(f.marketValue)}</b>
-          <select data-action="change-fund-class" data-fund="${esc(f.fund.id)}" aria-label="修改资产大类">
-            ${ASSET_CLASSES.map((c) => `<option value="${c.key}"${c.key === f.fund.assetClass ? ' selected' : ''}>${esc(c.label)}</option>`).join('')}
-          </select>
         </div>`
         )
         .join('');
@@ -1647,7 +1637,7 @@ export function allocationPage(state, metricsMap, expandedCats = new Set(), macr
         ${
           macroData
             ? `<p class="macro-note"><b class="t-accent">◆</b> ${esc(rec.reason)}</p>
-      <p class="macro-note">三资产目标比例由推荐方案自动决定，宏观变化时自动切换；您只需维护每只基金的大类归属。</p>`
+      <p class="macro-note">三资产目标比例由推荐方案自动决定，宏观变化时自动切换；基金大类由基金类型自动归类。</p>`
             : '<p class="macro-note">宏观数据暂缺，当前按「平衡」方案兜底；进入「宏观」页加载数据后自动切换。</p>'
         }
       </section>`;
@@ -1658,7 +1648,7 @@ export function allocationPage(state, metricsMap, expandedCats = new Set(), macr
         <h2 class="card-title">三资产再平衡</h2>
         <p class="card-sub">按权益 / 债券 / 黄金三个大类统计偏差与调仓金额；点击行展开基金明细。</p>
         <div class="alloc-list">${assetRows}</div>
-        <p class="macro-note">目标合计 <b class="num ${three.targetTotalOk ? 'ok' : 'warn'}">${fmtPct(three.targetTotal, { signed: false })}</b>。大类归属可在展开的基金行内切换。</p>
+        <p class="macro-note">目标合计 <b class="num ${three.targetTotalOk ? 'ok' : 'warn'}">${fmtPct(three.targetTotal, { signed: false })}</b>。大类由基金类型自动归类，无需手动维护。</p>
       </section>`;
 
   return `
