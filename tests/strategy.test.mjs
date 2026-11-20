@@ -12,6 +12,7 @@ import {
   recommendAssetScheme,
   resolveStrategyByKey,
   simulateAdd,
+  sparklineData,
   summarizeAttention,
   validateStrategy
 } from '../js/strategy.js';
@@ -598,6 +599,30 @@ test('回测：非法策略 key 兜底普通方案；脏数据（null/负值/格
   assert.equal(r1.sampleSize, 20); // 23 − 3 条脏数据
   const r2 = backtestStrategy([null, { date: 'x', nav: 0 }], 'NORMAL');
   assert.equal(r2.ok, false);
+});
+
+// ===== 净值走势 sparklineData =====
+
+test('sparkline：样本 <5 → null；有效样本归一化到 68×24 视口内', () => {
+  assert.equal(sparklineData([1, 2, 3, 4]), null);
+  assert.equal(sparklineData(null), null);
+  const data = sparklineData([1, 1.1, 1.2, 1.3, 1.4, 1.5]);
+  assert.equal(data.dir, 'up');
+  for (const pair of data.points.split(' ')) {
+    const [x, y] = pair.split(',').map(Number);
+    assert.ok(x >= 1 && x <= 67 && y >= 1 && y <= 23, `点 (${x},${y}) 应在视口内`);
+  }
+});
+
+test('sparkline：首尾定色（涨 up / 跌 down / 平 flat）、脏数据过滤、只取尾部 60 点', () => {
+  assert.equal(sparklineData([1.5, 1.4, 1.3, 1.2, 1.1]).dir, 'down');
+  const flat = sparklineData([1, 1, 1, 1, 1]);
+  assert.equal(flat.dir, 'flat');
+  assert.ok(flat.points.split(' ')[0].endsWith(`,12.00`), 'max===min 走水平中线 y=12'); // H/2=12
+  const dirty = sparklineData([1, null, 0, -1, 1.2, 1.3, 1.4, 1.5]);
+  assert.equal(dirty.dir, 'up'); // null/0/-1 被过滤，剩 5 个有效点
+  const many = sparklineData(Array.from({ length: 80 }, (_, i) => 1 + i * 0.01));
+  assert.equal(many.points.split(' ').length, 60); // 尾部 60 点
 });
 
 // ===== 估值水平 computeValuationLevel（通用序列分位 + 分级 + 债券取反） =====

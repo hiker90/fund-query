@@ -568,6 +568,25 @@ a {
   margin: 12px 0;
 }
 
+.spark polyline {
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.spark.up polyline {
+  stroke: var(--up);
+}
+
+.spark.down polyline {
+  stroke: var(--down);
+}
+
+.spark.flat polyline {
+  stroke: var(--accent);
+}
+
 .badge {
   display: inline-flex;
   align-items: center;
@@ -666,6 +685,11 @@ a {
   align-items: baseline;
   gap: 8px;
   margin-top: 10px;
+}
+
+.fund-nav .spark {
+  margin-left: auto;
+  align-self: center;
 }
 
 .fund-nav strong {

@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, summarizeAttention } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, sparklineData, summarizeAttention } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -149,6 +149,13 @@ function nextTierHint(metrics) {
   return '所有补仓档位均已执行，保留最终储备';
 }
 
+/** 净值走势 sparkline（68×24 SVG polyline）：sparklineData 为 null 时返回空串不占位 */
+function sparklineSvg(history) {
+  const data = sparklineData(history);
+  if (!data) return '';
+  return `<svg class="spark ${data.dir}" width="68" height="24" viewBox="0 0 68 24" aria-hidden="true"><polyline points="${data.points}"/></svg>`;
+}
+
 function fundCard(metrics, valuation = null) {
   const { fund } = metrics;
   const hasPosition = metrics.avgCost > 0;
@@ -167,6 +174,7 @@ function fundCard(metrics, valuation = null) {
       <div class="fund-nav">
         <strong class="num">${fmtNav(metrics.nav)}</strong>
         <span class="muted">净值 ${fmtDate(fund.navDate)}</span>
+        ${hasPosition ? sparklineSvg(fund.navHistory) : ''}
       </div>
       <div class="fund-metrics">
         <div>

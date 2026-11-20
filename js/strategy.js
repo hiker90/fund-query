@@ -827,3 +827,34 @@ export function backtestStrategy(navHistory, strategyKey, initialAmount = 10000)
     addTotalAmount
   };
 }
+
+/**
+ * sparkline 采样：navHistory 尾部 ≤samples 点归一化到 68×24 视口（内缩 1px）。
+ * 有效样本（nav>0）< 5 → null；max===min 走水平中线；dir 按首尾涨跌（up/down/flat）。
+ * 纯函数，脏数据过滤不抛错。
+ */
+export function sparklineData(history, samples = 60) {
+  const series = (Array.isArray(history) ? history : [])
+    .map((p) => (typeof p === 'number' ? p : Number(p && p.nav)))
+    .filter((nav) => Number.isFinite(nav) && nav > 0)
+    .slice(-samples);
+  if (series.length < 5) return null;
+
+  const W = 68;
+  const H = 24;
+  const PAD = 1;
+  const min = Math.min(...series);
+  const max = Math.max(...series);
+  const span = max - min;
+  const step = span > EPS ? (W - PAD * 2) / (series.length - 1) : 0;
+  const points = series
+    .map((nav, i) => {
+      const x = PAD + step * i;
+      const y = span > EPS ? PAD + (1 - (nav - min) / span) * (H - PAD * 2) : H / 2;
+      return `${x.toFixed(2)},${y.toFixed(2)}`;
+    })
+    .join(' ');
+  const last = series[series.length - 1];
+  const dir = last > series[0] + EPS ? 'up' : last < series[0] - EPS ? 'down' : 'flat';
+  return { points, dir };
+}
