@@ -1,6 +1,6 @@
 {
   "name": "fundpilot",
-  "version": "1.4.0",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "description": "本地优先的基金持仓监控与分档补仓策略工具",
