@@ -674,11 +674,37 @@ function handleTrade(form) {
 
   const type = form.elements.type.value === 'SELL' ? 'SELL' : 'BUY';
   const date = form.elements.date.value || todayISO();
+  const source = form.elements.source?.value === 'ADD' ? 'ADD' : 'BASE';
   const nav = num(form.elements.nav.value);
-  const amount = num(form.elements.amount.value);
   const fee = num(form.elements.fee.value);
-  const sharesInput = num(form.elements.shares.value);
-  const shares = sharesInput > 0 ? sharesInput : nav > 0 ? amount / nav : 0;
+
+  let amount = num(form.elements.amount.value);
+  let buyNav = 0;
+  let shares = 0;
+
+  // 底仓买入（非补仓锁定）支持「市值 + 收益率」反推
+  const baseMode = String(form.querySelector('[name="baseMode"]:checked')?.value || 'trade');
+  const allowPnl = type === 'BUY' && source === 'BASE';
+
+  if (allowPnl && baseMode === 'pnl') {
+    const holdingAmount = num(form.elements.holdingAmount.value);
+    const returnPct = num(form.elements.returnPct.value);
+    if (holdingAmount > 0 && nav > 0) {
+      const cost = holdingAmount / (1 + returnPct / 100);
+      shares = holdingAmount / nav;
+      amount = cost;
+      buyNav = cost / shares;
+    } else if (holdingAmount > 0 && nav <= 0) {
+      toast('请填写最新净值以便反推', 'error');
+      return;
+    }
+  } else {
+    // 成交方式（原有）
+    buyNav = nav;
+    const sharesInput = num(form.elements.shares.value);
+    shares = sharesInput > 0 ? sharesInput : nav > 0 ? amount / nav : 0;
+    if (amount <= 0 && shares > 0) amount = shares * nav;
+  }
 
   if (nav <= 0) {
     toast('请填写有效的成交净值', 'error');
@@ -700,13 +726,13 @@ function handleTrade(form) {
     id: store.uid(),
     type,
     date,
-    nav,
-    amount: amount > 0 ? amount : shares * nav,
+    nav: allowPnl && baseMode === 'pnl' && buyNav > 0 ? buyNav : nav,
+    amount,
     shares,
     fee,
-    source: form.elements.source.value === 'ADD' ? 'ADD' : 'BASE',
+    source,
     tierIndex: tierIndexRaw === '' ? null : Number(tierIndexRaw),
-    note: String(form.elements.note.value || '').trim(),
+    note: String(form.elements.note.value || '').trim() || (allowPnl && baseMode === 'pnl' ? '底仓买入（市值+收益率反推）' : ''),
     closed: false,
     createdAt: Date.now()
   };

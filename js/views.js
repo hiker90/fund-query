@@ -1302,11 +1302,22 @@ export function addFundSheetBody(categories = []) {
 
 export function tradeSheetBody(fund, metrics, preset = {}) {
   const isSell = preset.type === 'SELL';
+  const isBase = (preset.source || 'BASE') === 'BASE';
+  const isBuy = !isSell;
   const today = todayISO();
   const nav = preset.nav || metrics.nav || 0;
   const defaultAmount =
     preset.amount || (isSell ? Math.round(metrics.marketValue || 0) : '');
   const lockedSource = Number.isInteger(preset.tierIndex);
+
+  // 底仓买入（非补仓锁定）支持两种录入方式：成交金额+净值 / 市值+收益率反推
+  const baseModeBlock =
+    isBase && isBuy && !lockedSource
+      ? `<div class="segmented" data-toggle="base-mode">
+          <label><input type="radio" name="baseMode" value="trade" checked><span>成交金额 + 净值</span></label>
+          <label><input type="radio" name="baseMode" value="pnl"><span>市值 + 收益率</span></label>
+        </div>`
+      : '';
 
   return `
     <form class="form" data-form="add-trade" data-fund="${esc(fund.id)}">
@@ -1331,10 +1342,26 @@ export function tradeSheetBody(fund, metrics, preset = {}) {
         ${field({ label: '成交日期', name: 'date', value: preset.date || today, type: 'date', inputmode: 'none' })}
         ${field({ label: '成交净值', name: 'nav', value: nav ? nav.toFixed(4) : '', placeholder: '0.0000' })}
       </div>
-      <div class="field-grid">
-        ${field({ label: '金额（元）', name: 'amount', value: defaultAmount, placeholder: '0.00' })}
-        ${field({ label: '份额（可选）', name: 'shares', value: preset.shares || '', placeholder: '留空自动计算' })}
+
+      ${baseModeBlock}
+      <div data-base-panel="trade">
+        <div class="field-grid">
+          ${field({ label: '金额（元）', name: 'amount', value: defaultAmount, placeholder: '0.00' })}
+          ${field({ label: '份额（可选）', name: 'shares', value: preset.shares || '', placeholder: '留空自动计算' })}
+        </div>
       </div>
+      ${
+        baseModeBlock
+          ? `<div data-base-panel="pnl" hidden>
+               <div class="field-grid">
+                 ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
+                 ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5' })}
+               </div>
+               <small class="hint">反推：成本 = 市值 / (1+收益率)，份额 = 市值 / 当前净值</small>
+             </div>`
+          : ''
+      }
+
       ${field({ label: '手续费（元）', name: 'fee', value: '', placeholder: '0' })}
       ${field({ label: '备注', name: 'note', value: preset.note || '', placeholder: '可选', inputmode: 'text' })}
       <button class="btn primary block" type="submit">${isSell ? '登记卖出' : '登记买入'}</button>
