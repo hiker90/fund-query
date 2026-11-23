@@ -25,21 +25,53 @@ export function statusMeta(status) {
   return STATUS_META[status] || STATUS_META.normal;
 }
 
-const HOLDINGS_FILTERS = [
-  { key: 'all', label: '全部', match: () => true },
-  { key: 'add', label: '可补仓', match: (m) => m.status === 'add' },
-  {
-    key: 'take',
-    label: '止盈',
-    match: (m) => m.status === 'takeProfit' || m.status === 'trailing'
-  },
-  {
-    key: 'stop',
-    label: '止损',
-    match: (m) => m.status === 'stop' || m.status === 'nearStop'
-  },
-  { key: 'normal', label: '运行中', match: (m) => m.status === 'normal' }
+/** 5 类基金状态分组（匹配用：groupKey → 底层 metrics.status[] + 展示 meta） */
+const STATUS_GROUPS = [
+  { key: 'active', label: '进行中', tone: 'ok', matches: ['normal'] },
+  { key: 'add', label: '待补仓', tone: 'accent', matches: ['add'] },
+  { key: 'take', label: '待止盈', tone: 'warn', matches: ['takeProfit', 'trailing'] },
+  { key: 'stop', label: '待止损', tone: 'danger', matches: ['stop', 'nearStop'] },
+  { key: 'other', label: '其他', tone: 'flat', matches: ['none'] }
 ];
+
+function statusGroupOf(metricsStatus) {
+  for (const g of STATUS_GROUPS) {
+    if (g.matches.includes(metricsStatus)) return g.key;
+  }
+  return 'other';
+}
+
+/** 匹配复合筛选条件：空 Set 表示该维度不过滤 */
+function matchFilterState(metrics, filterState) {
+  const f = metrics.fund;
+  if (filterState.statuses.size && !filterState.statuses.has(statusGroupOf(metrics.status))) return false;
+  if (filterState.assetClasses.size && !filterState.assetClasses.has(f.assetClass || 'EQUITY')) return false;
+  if (filterState.strategies.size) {
+    const effectiveStrategyKey = metrics.strategy
+      ? (f.strategyOverride && ['NORMAL', 'AGGRESSIVE', 'NONE'].includes(f.strategyOverride)
+          ? f.strategyOverride
+          : (f.assetClass === 'EQUITY' ? 'GLOBAL' : 'NONE'))
+      : 'NONE';
+    if (!filterState.strategies.has(effectiveStrategyKey)) return false;
+  }
+  if (filterState.categories.size) {
+    const cat = f.category || '';
+    if (!filterState.categories.has(cat)) return false;
+  }
+  if (filterState.ftypes.size && !filterState.ftypes.has(f.ftype || '')) return false;
+  return true;
+}
+
+const SORT_LABELS = {
+  status: '策略状态',
+  marketValue: '持仓金额',
+  holdingPnlPct: '当前收益率',
+  assetClass: '三资产类型',
+  category: '自定义分类'
+};
+
+const ASSET_CLASS_LABELS = { EQUITY: '权益', BOND: '债券', GOLD: '黄金' };
+const STRATEGY_LABELS = { NORMAL: '普通', AGGRESSIVE: '激进', NONE: '不启用', GLOBAL: '跟随全局' };
 
 /** 今日关注卡折叠态（模块态，不持久化） */
 let attentionExpanded = false;
@@ -230,44 +262,55 @@ function emptyState() {
     </div>`;
 }
 
-export function holdingsPage(state, metricsMap, { refreshing = false, filter = 'all', valuations = null, macro = null } = {}) {
-  const metricsList = state.funds
+export function holdingsPage(state, metricsMap, { refreshing = false, filterState, sortBy = 'status', sortDir = 'asc', valuations = null, macro = null } = {}) {
+  // 完整 metrics 列表（先按 status rank 排，后面再按 sortBy 排）
+  const fullList = state.funds
     .map((fund) => metricsMap.get(fund.id))
-    .filter(Boolean)
-    .sort((a, b) => statusMeta(a.status).rank - statusMeta(b.status).rank);
+    .filter(Boolean);
+
+  // 筛选
+  const filteredList = filterState
+    ? fullList.filter((m) => matchFilterState(m, filterState))
+    : fullList.slice();
+
+  // 排序
+  filteredList.sort((a, b) => compareMetrics(a, b, sortBy, sortDir));
 
   let cost = 0;
   let value = 0;
   let updatedAt = 0;
-  metricsList.forEach((metrics) => {
-    cost += metrics.position.cost;
-    value += metrics.marketValue;
-    updatedAt = Math.max(updatedAt, num(metrics.fund.navUpdatedAt));
+  fullList.forEach((m) => {
+    cost += m.position.cost;
+    value += m.marketValue;
+    updatedAt = Math.max(updatedAt, num(m.fund.navUpdatedAt));
   });
   const pnl = value - cost;
   const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;
   const updatedLabel = updatedAt
-    ? new Date(updatedAt).toLocaleString('zh-CN', {
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit'
-      })
+    ? new Date(updatedAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
     : '尚未刷新';
 
-  const activeFilter = HOLDINGS_FILTERS.find((f) => f.key === filter) || HOLDINGS_FILTERS[0];
-  const filteredList = metricsList.filter(activeFilter.match);
-  const filterTabs = HOLDINGS_FILTERS.map((f) => {
-    const count = metricsList.filter(f.match).length;
-    return `
-      <button class="filter-tab${f.key === activeFilter.key ? ' is-active' : ''}" type="button"
-        data-action="filter-holdings" data-filter="${f.key}">
-        ${esc(f.label)}${count ? ` <em>${count}</em>` : ''}
-      </button>`;
-  }).join('');
+  // 工具栏：筛选按钮 + 排序按钮 + 基金计数
+  const totalCount = fullList.length;
+  const filteredCount = filteredList.length;
+  const hasFilter = filterState && (
+    filterState.statuses.size || filterState.assetClasses.size || filterState.strategies.size || filterState.categories.size || filterState.ftypes.size
+  );
+  const filterBadge = hasFilter ? `<em class="tb-badge on">${filteredCount}/${totalCount}</em>` : (totalCount ? `<em class="tb-badge">${totalCount}</em>` : '');
+  const sortLabel = SORT_LABELS[sortBy] || '策略状态';
+  const sortArrow = sortDir === 'asc' ? '↑' : '↓';
 
-  const filterBar = metricsList.length
-    ? `<div class="filter-tabs" role="tablist" aria-label="按状态筛选基金">${filterTabs}</div>`
+  const filterBar = totalCount
+    ? `<div class="filter-bar">
+        <button class="tb-btn" type="button" data-action="open-holdings-filter">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M6 12h12M10 18h4"/></svg>
+          筛选${filterBadge}
+        </button>
+        <button class="tb-btn" type="button" data-action="open-holdings-sort">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 4v16M7 20l-3-3M7 20l3-3M17 20V4M17 4l-3 3M17 4l3 3"/></svg>
+          ${esc(sortLabel)} <em>${sortArrow}</em>
+        </button>
+      </div>`
     : '';
 
   return `
@@ -300,23 +343,167 @@ export function holdingsPage(state, metricsMap, { refreshing = false, filter = '
             <b class="num">¥ ${fmtMoney(cost)}</b>
           </div>
         </div>
-        <p class="hero-note">${metricsList.length} 只基金 · 净值更新 ${esc(updatedLabel)}</p>
+        <p class="hero-note">${totalCount} 只基金 · 净值更新 ${esc(updatedLabel)}</p>
       </section>
 
-      ${attentionCardHtml(metricsList)}
+      ${attentionCardHtml(fullList)}
       ${filterBar}
       ${
         filteredList.length
           ? `<section class="fund-list">${filteredList
-              .map((metrics) => fundCard(metrics, valuations && valuations.get(metrics.fund.code), macro))
+              .map((m) => fundCard(m, valuations && valuations.get(m.fund.code), macro))
               .join('')}</section>`
-          : metricsList.length
-            ? `<div class="empty-state compact"><p>「${esc(activeFilter.label)}」状态下暂无基金</p></div>`
+          : totalCount
+            ? `<div class="empty-state compact"><p>筛选结果为空，当前条件 ${esc(summarizeFilter(filterState))}</p>
+                <button class="btn ghost" type="button" data-action="reset-holdings-filter">清除筛选</button>
+              </div>`
             : emptyState()
       }
       <p class="footnote">数据仅保存在本机浏览器，不构成投资建议。</p>
     </main>
     <button class="fab" type="button" data-action="add-fund" aria-label="添加基金">＋</button>`;
+}
+
+/** 两个 metrics 的通用比较器 */
+function compareMetrics(a, b, sortBy, sortDir) {
+  const dir = sortDir === 'desc' ? -1 : 1;
+  let cmp = 0;
+  switch (sortBy) {
+    case 'marketValue':
+      cmp = a.marketValue - b.marketValue;
+      break;
+    case 'holdingPnlPct':
+      cmp = a.holdingPnlPct - b.holdingPnlPct;
+      break;
+    case 'assetClass': {
+      const order = { EQUITY: 0, BOND: 1, GOLD: 2 };
+      cmp = (order[a.fund.assetClass] ?? 9) - (order[b.fund.assetClass] ?? 9);
+      if (cmp === 0) cmp = a.marketValue - b.marketValue;
+      break;
+    }
+    case 'category': {
+      cmp = String(a.fund.category || '').localeCompare(String(b.fund.category || ''), 'zh-CN');
+      if (cmp === 0) cmp = a.marketValue - b.marketValue;
+      break;
+    }
+    case 'status':
+    default:
+      cmp = statusMeta(a.status).rank - statusMeta(b.status).rank;
+      break;
+  }
+  // 同分时用市值兜底降序（让用户有稳定感）
+  if (cmp === 0) cmp = b.marketValue - a.marketValue;
+  return cmp * dir;
+}
+
+/** 空态下生成筛选摘要 */
+function summarizeFilter(filterState) {
+  if (!filterState) return '';
+  const parts = [];
+  if (filterState.statuses.size) parts.push(`状态=${[...filterState.statuses].map((k) => STATUS_GROUPS.find((g) => g.key === k)?.label || k).join('/')}`);
+  if (filterState.ftypes.size) parts.push(`类型=${[...filterState.ftypes].join('/')}`);
+  if (filterState.assetClasses.size) parts.push(`三资产=${[...filterState.assetClasses].map((k) => ASSET_CLASS_LABELS[k] || k).join('/')}`);
+  if (filterState.strategies.size) parts.push(`策略=${[...filterState.strategies].map((k) => STRATEGY_LABELS[k] || k).join('/')}`);
+  if (filterState.categories.size) parts.push(`分类=${[...filterState.categories].map((k) => k || '未分类').join('/')}`);
+  return parts.join(' · ');
+}
+
+/** 持仓页筛选 sheet body：多选 */
+export function holdingsFilterSheetBody(state, filterState) {
+  const usedAssetClasses = new Set();
+  const usedStrategies = new Set();
+  const usedCategories = new Set(['']);
+  const usedFtypes = new Set();
+
+  state.funds.forEach((fund) => {
+    usedAssetClasses.add(fund.assetClass || 'EQUITY');
+    usedCategories.add(fund.category || '');
+    if (fund.strategyOverride && ['NORMAL', 'AGGRESSIVE', 'NONE'].includes(fund.strategyOverride)) {
+      usedStrategies.add(fund.strategyOverride);
+    } else {
+      usedStrategies.add('GLOBAL');
+    }
+    if (fund.ftype) usedFtypes.add(fund.ftype);
+  });
+
+  // 状态 5 大类（始终展示）
+  const statusOptions = STATUS_GROUPS.map((g) => ({
+    key: g.key,
+    label: g.label,
+    tone: g.tone
+  }));
+
+  return `
+    <div class="sheet-filter-group">
+      <h4>基金状态</h4>
+      <div class="chip-row">
+        ${statusOptions.map((opt) => chipOption('hf-status', opt.key, opt.label, filterState.statuses.has(opt.key), opt.tone)).join('')}
+      </div>
+    </div>
+    ${usedFtypes.size > 0 ? `
+    <div class="sheet-filter-group">
+      <h4>基金类型（FTYPE）</h4>
+      <div class="chip-row">
+        ${[...usedFtypes].sort().map((k) => chipOption('hf-ft', k, k, filterState.ftypes.has(k))).join('')}
+      </div>
+    </div>` : ''}
+    ${usedAssetClasses.size > 1 ? `
+    <div class="sheet-filter-group">
+      <h4>三资产类型</h4>
+      <div class="chip-row">
+        ${[...usedAssetClasses].map((k) => chipOption('hf-ac', k, ASSET_CLASS_LABELS[k] || k, filterState.assetClasses.has(k))).join('')}
+      </div>
+    </div>` : ''}
+    ${usedStrategies.size > 1 ? `
+    <div class="sheet-filter-group">
+      <h4>策略</h4>
+      <div class="chip-row">
+        ${[...usedStrategies].map((k) => chipOption('hf-strat', k, STRATEGY_LABELS[k] || k, filterState.strategies.has(k))).join('')}
+      </div>
+    </div>` : ''}
+    ${state.categories.length > 0 || (usedCategories.size > 1 && [...usedCategories].some((c) => c)) ? `
+    <div class="sheet-filter-group">
+      <h4>自定义分类</h4>
+      <div class="chip-row">
+        ${[...usedCategories].sort((a, b) => a.localeCompare(b, 'zh-CN')).map((k) => chipOption('hf-cat', k, k || '未分类', filterState.categories.has(k))).join('')}
+      </div>
+    </div>` : ''}
+    <div class="sheet-actions">
+      <button class="btn ghost" type="button" data-action="reset-holdings-filter">清除筛选</button>
+      <button class="btn primary" type="button" data-action="close-sheet">完成</button>
+    </div>`;
+}
+
+/** 持仓页排序 sheet body：单选 + 升降序 */
+export function holdingsSortSheetBody(sortBy, sortDir) {
+  const options = ['status', 'marketValue', 'holdingPnlPct', 'assetClass', 'category'];
+  return `
+    <div class="sheet-filter-group">
+      <h4>排序维度</h4>
+      <div class="chip-row">
+        ${options.map((k) => chipOption('hs-by', k, SORT_LABELS[k], sortBy === k, 'accent')).join('')}
+      </div>
+    </div>
+    <div class="sheet-filter-group">
+      <h4>方向</h4>
+      <div class="chip-row">
+        ${chipOption('hs-dir', 'asc', sortBy === 'holdingPnlPct' || sortBy === 'marketValue' ? '升序（低→高）' : '升序（前→后）', sortDir === 'asc')}
+        ${chipOption('hs-dir', 'desc', sortBy === 'holdingPnlPct' || sortBy === 'marketValue' ? '降序（高→低）' : '降序（后→前）', sortDir === 'desc')}
+      </div>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn ghost" type="button" data-action="close-sheet">取消</button>
+    </div>`;
+}
+
+/** 筛选/排序 sheet 里的多选 chip */
+function chipOption(group, value, label, checked, tone) {
+  const v = String(value);
+  const extras = tone ? ` tone-${tone}` : '';
+  return `<label class="chip-option${checked ? ' is-on' : ''}${extras}" data-group="${group}" data-value="${esc(v)}">
+    <input type="checkbox" data-group="${group}" data-value="${esc(v)}" ${checked ? 'checked' : ''} hidden>
+    <span>${esc(label)}</span>
+  </label>`;
 }
 
 function ladderRow(label, value, extra, kind) {
@@ -1284,7 +1471,7 @@ export function addFundSheetBody(categories = []) {
       <div data-base-panel="pnl">
         <div class="field-grid">
           ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
-          ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', hint: '正数=盈利，负数=亏损' })}
+          ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', hint: '正数=盈利，负数=亏损', inputmode: 'text' })}
         </div>
         <p class="hint-line" id="base-derive-hint" hidden>
           反推结果：成本 <b id="derived-cost">—</b> 元 · 份额 <b id="derived-shares">—</b> 份 · 成本净值 <b id="derived-nav">—</b>
@@ -1355,7 +1542,7 @@ export function tradeSheetBody(fund, metrics, preset = {}) {
           ? `<div data-base-panel="pnl" hidden>
                <div class="field-grid">
                  ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
-                 ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5' })}
+                 ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', inputmode: 'text' })}
                </div>
                <small class="hint">反推：成本 = 市值 / (1+收益率)，份额 = 市值 / 当前净值</small>
              </div>`

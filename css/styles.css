@@ -436,6 +436,117 @@ a {
   color: #fff;
 }
 
+/* 持仓页筛选/排序工具栏 */
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tb-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.tb-btn:active {
+  transform: scale(0.98);
+  background: var(--fill-strong);
+}
+
+.tb-btn em {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--fill-strong);
+  color: var(--muted);
+}
+
+.tb-badge {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--fill-strong);
+  color: var(--muted);
+}
+
+.tb-badge.on {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* sheet 内筛选/排序 chip 组 */
+.sheet-filter-group {
+  margin-bottom: 18px;
+}
+
+.sheet-filter-group h4 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip-option {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--fill-strong);
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
+}
+
+.chip-option.is-on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.chip-option.is-on.tone-ok { background: var(--ok); border-color: var(--ok); color: #fff; }
+.chip-option.is-on.tone-warn { background: var(--warn); border-color: var(--warn); color: var(--text); }
+.chip-option.is-on.tone-danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.chip-option.is-on.tone-accent { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* sheet 底部 action 按钮行 */
+.sheet-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.sheet-actions .btn { flex: 1; }
+
 .fund-list {
   display: flex;
   flex-direction: column;

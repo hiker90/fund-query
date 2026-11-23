@@ -31,7 +31,17 @@ let macroData = null;
 let macroLoading = false;
 const expandedAllocCats = new Set();
 const expandedAssetClasses = new Set();
-let holdingsFilter = 'all';
+/** 持仓页复合筛选：空 Set 表示该维度不过滤 */
+const holdingsFilterState = {
+  statuses: new Set(),      // Set<'active'|'add'|'take'|'stop'|'other'>  5 类分组 key
+  ftypes: new Set(),        // Set<string>  基金 ftype 原值
+  assetClasses: new Set(),  // 'EQUITY' | 'BOND' | 'GOLD'
+  strategies: new Set(),    // 'NORMAL' | 'AGGRESSIVE' | 'NONE' | 'GLOBAL'
+  categories: new Set()     // category name 字符串；空字符串=未分类
+};
+/** 持仓页排序：维度 key + 升降序 */
+let holdingsSortBy = 'status'; // 'status' | 'marketValue' | 'holdingPnlPct' | 'assetClass' | 'category'
+let holdingsSortDir = 'asc';   // 'asc' | 'desc'
 
 // 持仓页按需拉取：进入路由时自动拉一次，5 分钟内不重复（无定时器轮询）
 let lastAutoFetchAt = 0;
@@ -279,7 +289,9 @@ function render() {
     currentFundId = null;
     app.innerHTML = views.holdingsPage(state, buildMetricsMap(), {
       refreshing,
-      filter: holdingsFilter,
+      filterState: holdingsFilterState,
+      sortBy: holdingsSortBy,
+      sortDir: holdingsSortDir,
       valuations: buildValuationMap(),
       macro: macroData
     });
@@ -933,6 +945,32 @@ async function clearAllData() {
   toast('数据已清空', 'success');
 }
 
+/** 处理 sheet 内 chip-option 点击：hf-=筛选(多选) / hs-=排序(单选) */
+function handleSheetChip(group, value) {
+  if (!group) return;
+
+  if (group.startsWith('hf-')) {
+    const setMap = {
+      'hf-status': holdingsFilterState.statuses,
+      'hf-ft': holdingsFilterState.ftypes,
+      'hf-ac': holdingsFilterState.assetClasses,
+      'hf-strat': holdingsFilterState.strategies,
+      'hf-cat': holdingsFilterState.categories
+    };
+    const set = setMap[group];
+    if (!set) return;
+    if (set.has(value)) set.delete(value);
+    else set.add(value);
+    showSheet({ title: '筛选基金', body: views.holdingsFilterSheetBody(state, holdingsFilterState), tall: true });
+    render();
+  } else if (group.startsWith('hs-')) {
+    if (group === 'hs-by') holdingsSortBy = value;
+    else if (group === 'hs-dir') holdingsSortDir = value;
+    render();
+    showSheet({ title: '排序基金', body: views.holdingsSortSheetBody(holdingsSortBy, holdingsSortDir) });
+  }
+}
+
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Enter' && event.key !== ' ') return;
   const el = event.target.closest('[data-action="toggle-alloc"]');
@@ -942,6 +980,17 @@ document.addEventListener('keydown', (event) => {
 });
 
 document.addEventListener('click', (event) => {
+  // sheet 里的筛选/排序 chip 点击处理（chip-option label）
+  const chip = event.target.closest('.chip-option');
+  if (chip) {
+    const group = chip.dataset.group;
+    const value = chip.dataset.value;
+    event.preventDefault();
+    event.stopPropagation();
+    handleSheetChip(group, value);
+    return;
+  }
+
   const target = event.target.closest('[data-action]');
   if (!target) return;
   const action = target.dataset.action;
@@ -1003,10 +1052,35 @@ document.addEventListener('click', (event) => {
       }
       break;
     }
-    case 'filter-holdings':
-      holdingsFilter = target.dataset.filter || 'all';
+    case 'open-holdings-filter': {
+      showSheet({
+        title: '筛选基金',
+        body: views.holdingsFilterSheetBody(state, holdingsFilterState),
+        tall: true
+      });
+      break;
+    }
+    case 'open-holdings-sort': {
+      showSheet({
+        title: '排序基金',
+        body: views.holdingsSortSheetBody(holdingsSortBy, holdingsSortDir)
+      });
+      break;
+    }
+    case 'reset-holdings-filter': {
+      holdingsFilterState.statuses.clear();
+      holdingsFilterState.ftypes.clear();
+      holdingsFilterState.assetClasses.clear();
+      holdingsFilterState.strategies.clear();
+      holdingsFilterState.categories.clear();
+      // 如果筛选 sheet 还开着，刷新 body
+      const sheet = document.getElementById('sheet-root');
+      if (sheet && !sheet.hidden) {
+        showSheet({ title: '筛选基金', body: views.holdingsFilterSheetBody(state, holdingsFilterState), tall: true });
+      }
       render();
       break;
+    }
     case 'toggle-attention':
       views.toggleAttentionExpanded();
       render();
