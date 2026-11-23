@@ -931,7 +931,7 @@ document.addEventListener('click', (event) => {
       openAddFund();
       break;
     case 'open-batch-import':
-      openBatchImport();
+      openBatchImport(); // showSheet 会替换当前弹层（从添加基金弹层跳转亦可）
       break;
     case 'batch-parse':
       handleBatchParse();

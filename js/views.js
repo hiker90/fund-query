@@ -1273,6 +1273,7 @@ export function addFundSheetBody(categories = []) {
         <label><input type="radio" name="baseMode" value="trade"><span>成交金额 + 净值</span></label>
         <label><input type="radio" name="baseMode" value="pnl" checked><span>市值 + 收益率</span></label>
       </div>
+      <button class="btn ghost block" type="button" data-action="open-batch-import">多只基金？批量导入底仓（代码, 金额, 收益率）</button>
 
       <div data-base-panel="trade" hidden>
         <div class="field-grid">
