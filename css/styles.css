@@ -766,6 +766,107 @@ a {
   text-align: right;
 }
 
+/* 策略预置卡（可编辑版） */
+.preset-card-editable {
+  padding: 16px;
+}
+
+.preset-card-editable .preset-head.editable {
+  cursor: default;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.preset-card-editable .radio-default {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preset-card-editable .radio-default input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+.preset-card-editable .radio-default b {
+  font-size: 15px;
+}
+
+.preset-card-editable .preset-desc {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 12px;
+}
+
+.preset-card-editable .preset-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.preset-sub-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 12px 0 4px;
+}
+
+.tiers-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preset-card-editable .tier-row {
+  grid-template-columns: 1fr 1fr;
+}
+
+.preset-card-editable .tier-row .field.inline {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+}
+
+.preset-card-editable .tier-row .field.inline span {
+  font-size: 12px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.preset-card-editable .tier-row .field.inline input {
+  flex: 1;
+  min-width: 0;
+  height: 42px;
+}
+
+.preset-card-editable .tier-row .field.inline em {
+  font-size: 12px;
+  color: var(--muted);
+  font-style: normal;
+  flex-shrink: 0;
+}
+
+.btn.ghost.tiny {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.btn.ghost.tiny:active {
+  background: var(--fill-strong);
+}
+
 .preset-list {
   list-style: none;
   margin: 12px 0 0;

@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, computeMacroAdvice, sparklineData, summarizeAttention } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, STRATEGY_KEYS, cloneStrategyPreset, computeMacroAdvice, sparklineData, summarizeAttention } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -914,8 +914,12 @@ function backtestCardHtml(funds) {
 
 export function strategyPage(state) {
   const currentKey = state.settings.defaultStrategy === 'AGGRESSIVE' ? 'AGGRESSIVE' : 'NORMAL';
-  const presetCards = Object.keys(STRATEGY_PRESETS)
-    .map((key) => presetCard(key, currentKey === key))
+  const customStrategies = state.settings.strategies || {
+    NORMAL: STRATEGY_PRESETS.NORMAL,
+    AGGRESSIVE: STRATEGY_PRESETS.AGGRESSIVE
+  };
+  const presetCards = STRATEGY_KEYS
+    .map((key) => presetCardEditable(key, customStrategies[key], currentKey === key))
     .join('');
   return `
     <header class="topbar">
@@ -928,9 +932,9 @@ export function strategyPage(state) {
     </header>
     <main class="page">
       <form class="form" data-form="strategy">
-        <p class="page-desc">选择全局默认策略，所有未单独覆盖的基金使用该方案。</p>
+        <p class="page-desc">调整止损/止盈/分档补仓等参数，保存后新参数对所有跟随该方案的基金生效。</p>
         ${presetCards}
-        <button class="btn primary block" type="submit">保存默认方案</button>
+        <button class="btn primary block" type="submit">保存所有方案</button>
       </form>
 
       ${backtestCardHtml(state.funds || [])}
@@ -938,7 +942,7 @@ export function strategyPage(state) {
       <section class="card notes">
         <h2 class="card-title">策略说明</h2>
         <ul class="notes-list">
-          <li><b>预置不可改：</b>普通 / 激进两套参数为只读预置；单只权益基金可在详情页选择「跟随全局 / 普通 / 激进 / 不启用」。</li>
+          <li><b>两方案独立：</b>普通 / 激进 两套参数均可自由调整；单只权益基金可在详情页选择「跟随全局 / 普通 / 激进 / 不启用」。</li>
           <li><b>策略不适用于三类基金：</b>债券 / 黄金 / 海外（QDII）权益基金不适用分档策略，系统按宏观指标给出方向参考（见宏观页），详情页不提供策略覆盖。</li>
           <li><b>不启用的含义：</b>选择「不启用」后该基金不再计算止损 / 止盈 / 分档提醒，仅记录成本与收益。</li>
           <li><b>先判断该不该补：</b>基金经理变更、策略漂移、规模接近清盘或指数规则重大调整时，不动用补仓资金。</li>
@@ -950,30 +954,63 @@ export function strategyPage(state) {
     </main>`;
 }
 
-/** 单张只读预置卡：普通 / 激进，radio 选择作为全局默认 */
-function presetCard(key, isCurrent) {
-  const preset = STRATEGY_PRESETS[key];
+/** 可编辑策略卡：普通 / 激进，支持参数修改、恢复默认、选中全局默认 */
+function presetCardEditable(key, preset, isCurrent) {
   if (!preset) return '';
   const label = key === 'AGGRESSIVE' ? '激进' : '普通';
   const desc = key === 'AGGRESSIVE' ? '止损更窄、止盈更高、补仓更早' : '节奏均衡，适合多数场景';
-  const tiersText = preset.addTiers
-    .map((tier) => `跌 ${tier.dropPct}% 补 ${fmtMoney(tier.amount, 0)} 元`)
-    .join('、');
+  const t = preset;
+  // 档位编辑行（固定 3 行，不足空行、超过截断）
+  const tierRows = [0, 1, 2].map((i) => {
+    const tier = (t.addTiers && t.addTiers[i]) || {};
+    return `
+      <div class="tier-row">
+        <label class="field inline">
+          <span>跌</span>
+          <input type="number" step="0.5" min="0" name="${key}__tier${i}_drop" value="${tier.dropPct ?? ''}" placeholder="5">
+          <em>%</em>
+        </label>
+        <label class="field inline">
+          <span>补</span>
+          <input type="number" step="100" min="0" name="${key}__tier${i}_amount" value="${tier.amount ?? ''}" placeholder="1200">
+          <em>元</em>
+        </label>
+      </div>`;
+  }).join('');
+
   return `
-    <section class="card preset-card">
-      <label class="preset-head">
-        <input type="radio" name="defaultStrategy" value="${key}" ${isCurrent ? 'checked' : ''}>
-        <b>${label}方案</b>
-        ${isCurrent ? '<span class="badge badge-accent">当前默认</span>' : ''}
-        <small>${esc(desc)}</small>
-      </label>
-      <ul class="preset-list">
-        <li><span>止损 / 止盈</span><b>-${preset.stopLossPct}% / +${preset.takeProfitPct}%</b></li>
-        <li><span>止盈卖出</span><b>达线先卖 ${preset.takeProfitSellRatio}%，峰值回撤 ${preset.trailingStopPct}% 清余仓</b></li>
-        <li><span>分档补仓</span><b>${esc(tiersText)}</b></li>
-        <li><span>最终储备</span><b>${fmtMoney(preset.reserveAmount, 0)} 元 · 跌超 ${preset.reserveTriggerPct}% 择机启用</b></li>
-        <li><span>补仓了结</span><b>批次收益 ≥ ${preset.addPositionSellPct}% 可单独卖出</b></li>
-      </ul>
+    <section class="card preset-card preset-card-editable" data-preset="${key}">
+      <header class="preset-head editable">
+        <label class="radio-default">
+          <input type="radio" name="defaultStrategy" value="${key}" ${isCurrent ? 'checked' : ''}>
+          <b>${label}方案</b>
+          ${isCurrent ? '<span class="badge badge-accent">当前默认</span>' : ''}
+        </label>
+        <button type="button" class="btn ghost tiny" data-action="reset-preset" data-key="${key}">恢复默认</button>
+      </header>
+      <small class="preset-desc">${esc(desc)}</small>
+
+      <div class="preset-fields">
+        <div class="field-grid">
+          ${field({ label: '止损线', name: `${key}__stopLossPct`, placeholder: '12', value: String(t.stopLossPct), inputmode: 'decimal', hint: '跌超此比例触发止损' })}
+          ${field({ label: '止盈线', name: `${key}__takeProfitPct`, placeholder: '20', value: String(t.takeProfitPct), inputmode: 'decimal', hint: '涨超此比例触发止盈' })}
+        </div>
+        <div class="field-grid">
+          ${field({ label: '止盈卖出比例', name: `${key}__takeProfitSellRatio`, placeholder: '40', value: String(t.takeProfitSellRatio), inputmode: 'decimal', hint: '达止盈线时先卖出的仓位占比（%）' })}
+          ${field({ label: '移动止盈回撤', name: `${key}__trailingStopPct`, placeholder: '8', value: String(t.trailingStopPct), inputmode: 'decimal', hint: '峰值回撤此比例时清剩余仓位（%）' })}
+        </div>
+
+        <h4 class="preset-sub-title">分档补仓</h4>
+        <div class="tiers-block" data-key="${key}">
+          ${tierRows}
+        </div>
+
+        <div class="field-grid">
+          ${field({ label: '最终储备', name: `${key}__reserveAmount`, placeholder: '2400', value: String(t.reserveAmount), inputmode: 'decimal', hint: '前几档用完后，剩余储备金额（元）' })}
+          ${field({ label: '储备触发跌幅', name: `${key}__reserveTriggerPct`, placeholder: '20', value: String(t.reserveTriggerPct), inputmode: 'decimal', hint: '需要启用储备时的跌幅阈值（%）' })}
+        </div>
+        ${field({ label: '补仓了结收益率', name: `${key}__addPositionSellPct`, placeholder: '6', value: String(t.addPositionSellPct), inputmode: 'decimal', hint: '补仓批次单独卖出的收益率阈值（%）' })}
+      </div>
     </section>`;
 }
 
@@ -1456,100 +1493,110 @@ export function addFundSheetBody(categories = []) {
       ${catSelect}
 
       <h3 class="form-section">初始底仓（可跳过）</h3>
-      <div class="segmented" data-toggle="base-mode">
-        <label><input type="radio" name="baseMode" value="trade"><span>成交金额 + 净值</span></label>
-        <label><input type="radio" name="baseMode" value="pnl" checked><span>市值 + 收益率</span></label>
-      </div>
-      <button class="btn ghost block" type="button" data-action="open-batch-import">多只基金？批量导入底仓（代码, 金额, 收益率）</button>
-
-      <div data-base-panel="trade" hidden>
-        <div class="field-grid">
-          ${field({ label: '买入金额（元）', name: 'amount', placeholder: '10000' })}
-          ${field({ label: '成交净值', name: 'buyNav', placeholder: '1.0000' })}
-        </div>
-      </div>
-      <div data-base-panel="pnl">
-        <div class="field-grid">
-          ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
-          ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', hint: '正数=盈利，负数=亏损', inputmode: 'text' })}
-        </div>
-        <p class="hint-line" id="base-derive-hint" hidden>
-          反推结果：成本 <b id="derived-cost">—</b> 元 · 份额 <b id="derived-shares">—</b> 份 · 成本净值 <b id="derived-nav">—</b>
-        </p>
-      </div>
-
+      <p class="hint">填写持仓市值和收益率，系统自动反推成本、份额和成本净值。</p>
       <div class="field-grid">
-        ${field({ label: '买入日期', name: 'buyDate', value: today, type: 'date', inputmode: 'none' })}
+        ${field({ label: '持仓日期', name: 'buyDate', value: today, type: 'date', inputmode: 'none' })}
         ${field({ label: '手续费（元）', name: 'fee', placeholder: '0' })}
       </div>
+      <div class="field-grid">
+        ${field({ label: '持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
+        ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', inputmode: 'text', hint: '正数=盈利，负数=亏损' })}
+      </div>
+      <p class="hint-line" id="base-derive-hint" hidden>
+        反推结果：成本 <b id="derived-cost">—</b> 元 · 份额 <b id="derived-shares">—</b> 份 · 成本净值 <b id="derived-nav">—</b>
+      </p>
+      <button class="btn ghost block" type="button" data-action="open-batch-import">多只基金？批量导入底仓（代码, 金额, 收益率）</button>
 
       <button class="btn primary block" type="submit">保存并开始监控</button>
     </form>`;
 }
 
+/** 在 fund 的 navHistory 里查找指定日期净值，找不到用最新净值兜底 */
+function resolveNavForDate(fund, dateStr) {
+  if (!fund) return null;
+  if (Array.isArray(fund.navHistory)) {
+    const hit = fund.navHistory.find((h) => h.date === dateStr);
+    if (hit) return { nav: hit.nav, date: hit.date, source: 'history' };
+    // 找该日期之前最近的一条（工作日净值）
+    const before = fund.navHistory
+      .filter((h) => h.date <= dateStr)
+      .sort((a, b) => b.date.localeCompare(a.date))[0];
+    if (before) return { nav: before.nav, date: before.date, source: 'history' };
+  }
+  if (fund.nav > 0) {
+    return { nav: fund.nav, date: fund.navDate || dateStr, source: 'latest' };
+  }
+  return null;
+}
+
 export function tradeSheetBody(fund, metrics, preset = {}) {
   const isSell = preset.type === 'SELL';
   const isBase = (preset.source || 'BASE') === 'BASE';
-  const isBuy = !isSell;
-  const today = todayISO();
-  const nav = preset.nav || metrics.nav || 0;
-  const defaultAmount =
-    preset.amount || (isSell ? Math.round(metrics.marketValue || 0) : '');
   const lockedSource = Number.isInteger(preset.tierIndex);
+  const today = todayISO();
+  const defaultDate = preset.date || today;
+  const navInfo = resolveNavForDate(fund, defaultDate);
+  const navHint = navInfo
+    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${navInfo.source === 'latest' ? '（最新）' : ''}`
+    : '<b class="warn">⚠ 暂无净值数据，请先刷新或查询</b>';
 
-  // 底仓买入（非补仓锁定）支持两种录入方式：成交金额+净值 / 市值+收益率反推
-  const baseModeBlock =
-    isBase && isBuy && !lockedSource
-      ? `<div class="segmented" data-toggle="base-mode">
-          <label><input type="radio" name="baseMode" value="trade" checked><span>成交金额 + 净值</span></label>
-          <label><input type="radio" name="baseMode" value="pnl"><span>市值 + 收益率</span></label>
-        </div>`
-      : '';
+  // 空基金（无份额且无交易记录）→ 只显示底仓登记（市值 + 收益率）
+  const hasPosition = !!(metrics && metrics.position && metrics.position.shares > 0);
+  const hasTrades = Array.isArray(fund.trades) && fund.trades.length > 0;
+  if (!hasPosition && !hasTrades) {
+    return `
+      <form class="form" data-form="add-trade" data-mode="base" data-fund="${esc(fund.id)}">
+        <p class="hint">该基金还没有持仓。填写当前市值和收益率，系统自动反推成本、份额和底仓成本净值。</p>
+        <div class="field-grid">
+          ${field({ label: '持仓日期', name: 'date', value: defaultDate, type: 'date', inputmode: 'none' })}
+          ${field({ label: '手续费（元）', name: 'fee', value: preset.fee || '', placeholder: '0' })}
+        </div>
+        <div class="field-grid">
+          ${field({ label: '持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
+          ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', inputmode: 'text', hint: '正数=盈利，负数=亏损' })}
+        </div>
+        <p class="hint-line" id="trade-nav-hint">${navHint}</p>
+        <button class="btn primary block" type="submit">登记底仓</button>
+      </form>`;
+  }
 
   return `
     <form class="form" data-form="add-trade" data-fund="${esc(fund.id)}">
       ${
-        lockedSource || isSell
+        lockedSource
           ? `<input type="hidden" name="source" value="${esc(preset.source || 'BASE')}">`
-          : `<label class="field">
-              <span>买入性质</span>
-              <select name="source">
-                <option value="BASE" selected>底仓买入（计入档位锚）</option>
-                <option value="ADD">补仓买入（可独立了结）</option>
-              </select>
-            </label>`
+          : `<div data-source-field ${isSell ? 'hidden' : ''}>
+              <label class="field">
+                <span>买入性质</span>
+                <select name="source">
+                  <option value="BASE" ${isBase ? 'selected' : ''}>底仓买入（计入档位锚）</option>
+                  <option value="ADD">补仓买入（可独立了结）</option>
+                </select>
+              </label>
+            </div>`
       }
       <input type="hidden" name="tierIndex" value="${Number.isInteger(preset.tierIndex) ? preset.tierIndex : ''}">
       <input type="hidden" name="batchId" value="${esc(preset.batchId || '')}">
+
       <div class="segmented">
-        <label><input type="radio" name="type" value="BUY" ${isSell ? '' : 'checked'}><span>买入 / 补仓</span></label>
-        <label><input type="radio" name="type" value="SELL" ${isSell ? 'checked' : ''}><span>卖出</span></label>
+        <label><input type="radio" name="type" value="BUY" ${isSell ? '' : 'checked'} data-toggle="trade-panel"><span>买入 / 补仓</span></label>
+        <label><input type="radio" name="type" value="SELL" ${isSell ? 'checked' : ''} data-toggle="trade-panel"><span>卖出</span></label>
       </div>
+
       <div class="field-grid">
-        ${field({ label: '成交日期', name: 'date', value: preset.date || today, type: 'date', inputmode: 'none' })}
-        ${field({ label: '成交净值', name: 'nav', value: nav ? nav.toFixed(4) : '', placeholder: '0.0000' })}
+        ${field({ label: '成交日期', name: 'date', value: defaultDate, type: 'date', inputmode: 'none' })}
+        ${field({ label: '手续费（元）', name: 'fee', value: preset.fee || '', placeholder: '0' })}
       </div>
 
-      ${baseModeBlock}
-      <div data-base-panel="trade">
-        <div class="field-grid">
-          ${field({ label: '金额（元）', name: 'amount', value: defaultAmount, placeholder: '0.00' })}
-          ${field({ label: '份额（可选）', name: 'shares', value: preset.shares || '', placeholder: '留空自动计算' })}
-        </div>
-      </div>
-      ${
-        baseModeBlock
-          ? `<div data-base-panel="pnl" hidden>
-               <div class="field-grid">
-                 ${field({ label: '当前持仓市值（元）', name: 'holdingAmount', placeholder: '10500' })}
-                 ${field({ label: '持仓收益率（%）', name: 'returnPct', placeholder: '5', inputmode: 'text' })}
-               </div>
-               <small class="hint">反推：成本 = 市值 / (1+收益率)，份额 = 市值 / 当前净值</small>
-             </div>`
-          : ''
-      }
+      <p class="hint-line" id="trade-nav-hint">${navHint}</p>
 
-      ${field({ label: '手续费（元）', name: 'fee', value: '', placeholder: '0' })}
+      <div data-trade-panel="BUY" ${isSell ? 'hidden' : ''}>
+        ${field({ label: '买入金额（元）', name: 'amount', value: preset.amount || '', placeholder: '0.00', hint: '份额 = 金额 ÷ 当日净值' })}
+      </div>
+      <div data-trade-panel="SELL" ${isSell ? '' : 'hidden'}>
+        ${field({ label: '卖出份额（份）', name: 'shares', value: preset.shares || '', placeholder: '0.000', hint: '卖出金额 = 份额 × 当日净值' })}
+      </div>
+
       ${field({ label: '备注', name: 'note', value: preset.note || '', placeholder: '可选', inputmode: 'text' })}
       <button class="btn primary block" type="submit">${isSell ? '登记卖出' : '登记买入'}</button>
     </form>`;

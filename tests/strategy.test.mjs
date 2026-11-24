@@ -471,8 +471,8 @@ test('迁移 v4：FTYPE 含黄金/债券优先于原大类', () => {
   assert.equal(migrated.funds[1].assetClass, 'BOND');
 });
 
-test('迁移 v4：VERSION === 4 且幂等（同一数据重复迁移 deepEqual）', () => {
-  assert.equal(VERSION, 4);
+test('迁移 v5：VERSION === 5 且幂等（同一数据重复迁移 deepEqual）', () => {
+  assert.equal(VERSION, 5);
   const raw = {
     version: 3,
     funds: [

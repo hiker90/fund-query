@@ -4,43 +4,74 @@
  */
 
 /**
- * 双预置策略方案（只读）：普通 / 激进。
- * 策略不再支持自由编辑参数，仅允许选择预置与单基金覆盖。
+ * 双预置策略方案（工厂默认值，非冻结 — 运行时会被用户自定义参数覆盖）。
+ * 策略支持手动调整止损/止盈/分档等参数，两个方案独立保存。
  */
-export const STRATEGY_PRESETS = Object.freeze({
-  NORMAL: Object.freeze({
+export const STRATEGY_PRESETS = {
+  NORMAL: {
     stopLossPct: 12,
     takeProfitPct: 20,
     takeProfitSellRatio: 40,
     trailingStopPct: 8,
-    addTiers: Object.freeze([
+    addTiers: [
       { dropPct: 5, amount: 1200 },
       { dropPct: 10, amount: 2000 },
       { dropPct: 15, amount: 2800 }
-    ]),
+    ],
     reserveAmount: 2400,
     reserveTriggerPct: 20,
     addPositionSellPct: 6
-  }),
-  AGGRESSIVE: Object.freeze({
+  },
+  AGGRESSIVE: {
     stopLossPct: 8,
     takeProfitPct: 25,
     takeProfitSellRatio: 50,
     trailingStopPct: 10,
-    addTiers: Object.freeze([
+    addTiers: [
       { dropPct: 4, amount: 1500 },
       { dropPct: 8, amount: 2500 },
       { dropPct: 12, amount: 3500 }
-    ]),
+    ],
     reserveAmount: 3000,
     reserveTriggerPct: 15,
     addPositionSellPct: 8
-  })
-});
+  }
+};
 
 export const STRATEGY_KEYS = Object.freeze(['NORMAL', 'AGGRESSIVE']);
 
-/** 兼容旧引用：默认策略 = 预置「普通」 */
+/** 深拷贝一份策略预设（保留 addTiers 结构） */
+export function cloneStrategyPreset(key) {
+  const p = STRATEGY_PRESETS[key] || STRATEGY_PRESETS.NORMAL;
+  return {
+    ...p,
+    addTiers: (p.addTiers || []).map((t) => ({ ...t }))
+  };
+}
+
+/**
+ * 用用户自定义对象覆盖工厂默认值。
+ * - custom 缺失或字段不合法 → 回退到工厂默认
+ * - addTiers 允许用户传不同长度（0–5 档）
+ */
+export function mergeStrategyWithPreset(key, custom) {
+  const preset = cloneStrategyPreset(key);
+  if (!custom || typeof custom !== 'object') return preset;
+  const merged = { ...preset };
+  for (const f of ['stopLossPct', 'takeProfitPct', 'takeProfitSellRatio', 'trailingStopPct',
+                   'reserveAmount', 'reserveTriggerPct', 'addPositionSellPct']) {
+    const v = Number(custom[f]);
+    if (Number.isFinite(v)) merged[f] = v;
+  }
+  if (Array.isArray(custom.addTiers) && custom.addTiers.length > 0) {
+    merged.addTiers = custom.addTiers
+      .map((t) => ({ dropPct: Number(t && t.dropPct), amount: Number(t && t.amount) }))
+      .filter((t) => Number.isFinite(t.dropPct) && Number.isFinite(t.amount) && t.dropPct > 0 && t.amount >= 0);
+  }
+  return merged;
+}
+
+/** 兼容旧引用：默认策略 = 预置「普通」原值（只读，如需编辑请使用 mergeStrategyWithPreset） */
 export const DEFAULT_STRATEGY = STRATEGY_PRESETS.NORMAL;
 
 const EPS = 1e-9;
@@ -74,16 +105,22 @@ export function strategyKeyFromLegacy(raw) {
  * 策略解析唯一入口。
  * @param {*} defaultKey 全局默认（'NORMAL'|'AGGRESSIVE'，兼容传入旧对象型）
  * @param {*} fundStrategyKey 单基金覆盖（null/空=跟随全局 | 'NORMAL'|'AGGRESSIVE'|'NONE'）
- * @returns null（NONE，不启用策略）或冻结的预置策略对象
+ * @param {*} customStrategies 用户自定义策略 { NORMAL:{}, AGGRESSIVE:{} }，可选
+ * @returns null（NONE，不启用策略）或策略对象（合并了用户自定义 + 工厂默认）
  */
-export function resolveStrategyByKey(defaultKey, fundStrategyKey) {
+export function resolveStrategyByKey(defaultKey, fundStrategyKey, customStrategies) {
   if (fundStrategyKey === 'NONE') return null;
   const fundKey =
     typeof fundStrategyKey === 'string' && STRATEGY_KEYS.includes(fundStrategyKey)
       ? fundStrategyKey
       : null;
   const effectiveKey = fundKey || strategyKeyFromLegacy(defaultKey);
-  return STRATEGY_PRESETS[effectiveKey] || STRATEGY_PRESETS.NORMAL;
+  if (!customStrategies) {
+    // 无用户自定义 → 返回工厂默认原值（保持测试/老代码引用相等）
+    return STRATEGY_PRESETS[effectiveKey] || STRATEGY_PRESETS.NORMAL;
+  }
+  const custom = customStrategies[effectiveKey];
+  return mergeStrategyWithPreset(effectiveKey, custom);
 }
 
 /** 本地日期 YYYY-MM-DD（纯函数，无 DOM 依赖） */
@@ -156,10 +193,10 @@ export function computePosition(trades = []) {
   };
 }
 
-export function computeFundMetrics(fund, defaultStrategy) {
+export function computeFundMetrics(fund, defaultStrategy, customStrategies) {
   const assetKind = fundAssetKind(fund);
   // v1.18 起债券/黄金/海外权益基金不适用分档策略，strategy 强制 null（status 恒 'none'）
-  const strategy = assetKind === 'EQUITY' ? resolveStrategyByKey(defaultStrategy, fund && fund.strategyOverride) : null;
+  const strategy = assetKind === 'EQUITY' ? resolveStrategyByKey(defaultStrategy, fund && fund.strategyOverride, customStrategies) : null;
   const position = computePosition(fund.trades);
   const nav = num(fund.nav);
   const avgCost = position.avgCost;
@@ -797,8 +834,8 @@ export function parseBatchText(text) {
  * - maxDrawdown 基于「市值+现金」账户总权益曲线
  * 有效样本（nav>0）< 20 → { ok:false, reason }；纯函数，脏数据过滤不抛错。
  */
-export function backtestStrategy(navHistory, strategyKey, initialAmount = 10000) {
-  const strategy = resolveStrategyByKey(strategyKey, null) || STRATEGY_PRESETS.NORMAL;
+export function backtestStrategy(navHistory, strategyKey, initialAmount = 10000, customStrategies) {
+  const strategy = resolveStrategyByKey(strategyKey, null, customStrategies) || mergeStrategyWithPreset(strategyKey, null);
   const series = (Array.isArray(navHistory) ? navHistory : [])
     .map((p) => ({ date: String((p && p.date) || ''), nav: Number(p && p.nav) }))
     .filter((p) => /^\d{4}-\d{2}-\d{2}$/.test(p.date) && Number.isFinite(p.nav) && p.nav > 0);

@@ -1,13 +1,15 @@
 import {
   DEFAULT_ASSET_TARGETS,
   STRATEGY_KEYS,
+  STRATEGY_PRESETS,
+  cloneStrategyPreset,
   classifyAssetClass,
   num,
   strategyKeyFromLegacy
 } from './strategy.js';
 
 const STORAGE_KEY = 'fundpilot.v1';
-export const VERSION = 4;
+export const VERSION = 5;
 
 export function uid() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -36,11 +38,34 @@ export function defaultState() {
     version: VERSION,
     settings: {
       defaultStrategy: 'NORMAL', // 'NORMAL' | 'AGGRESSIVE'
-      assetTargets: { ...DEFAULT_ASSET_TARGETS }
+      assetTargets: { ...DEFAULT_ASSET_TARGETS },
+      strategies: {
+        NORMAL: cloneStrategyPreset('NORMAL'),
+        AGGRESSIVE: cloneStrategyPreset('AGGRESSIVE')
+      }
     },
     categories: [],
     funds: []
   };
+}
+
+/** 清洗单个用户自定义策略对象（缺字段回退工厂默认） */
+function sanitizeStrategy(key, raw) {
+  const preset = cloneStrategyPreset(key);
+  if (!raw || typeof raw !== 'object') return preset;
+  const merged = { ...preset };
+  for (const f of ['stopLossPct', 'takeProfitPct', 'takeProfitSellRatio', 'trailingStopPct',
+                   'reserveAmount', 'reserveTriggerPct', 'addPositionSellPct']) {
+    const v = Number(raw[f]);
+    if (Number.isFinite(v) && v >= 0) merged[f] = v;
+  }
+  if (Array.isArray(raw.addTiers) && raw.addTiers.length > 0) {
+    const tiers = raw.addTiers
+      .map((t) => ({ dropPct: Number(t && t.dropPct), amount: Number(t && t.amount) }))
+      .filter((t) => Number.isFinite(t.dropPct) && t.dropPct > 0 && Number.isFinite(t.amount) && t.amount >= 0);
+    if (tiers.length > 0) merged.addTiers = tiers;
+  }
+  return merged;
 }
 
 function sanitizeTrade(trade) {
@@ -134,6 +159,13 @@ export function normalizeState(raw) {
   state.settings.assetTargets = sanitizeAssetTargets(
     raw.settings && typeof raw.settings === 'object' ? raw.settings.assetTargets : null
   );
+
+  // v5 新增：用户可编辑的策略参数；缺失时种子工厂默认
+  const rawStrategies = raw.settings && typeof raw.settings === 'object' && raw.settings.strategies;
+  state.settings.strategies = {
+    NORMAL: sanitizeStrategy('NORMAL', rawStrategies && rawStrategies.NORMAL),
+    AGGRESSIVE: sanitizeStrategy('AGGRESSIVE', rawStrategies && rawStrategies.AGGRESSIVE)
+  };
 
   state.categories = (Array.isArray(raw.categories) ? raw.categories : [])
     .map((cat) => ({
