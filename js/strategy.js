@@ -628,7 +628,7 @@ export function computeAllocation(state, metricsMap) {
     };
   });
 
-  // 把有实际市值但没配置目标的 category 也列出来（targetPct=0）
+  // 未配置目标的类别排在用户配置的类别之后，其余保持用户自定义顺序（配置页可拖动调整）
   const configuredNames = new Set(categories.map((c) => c.name));
   for (const [name, actual] of byCategory) {
     if (!configuredNames.has(name)) {
@@ -646,8 +646,8 @@ export function computeAllocation(state, metricsMap) {
     }
   }
 
-  // 按 |偏差| 降序排列，偏离最大的放前面
-  result.sort((a, b) => Math.abs(b.deviation) - Math.abs(a.deviation));
+  // 排序保持用户自定义顺序：categories.map 的顺序在前，未配置目标的类别追加在后。
+  // 占比行、饼图总览、图例均按此顺序展示（配置页「自定义分类」支持上下移动调整）。
 
   const uncategorizedValue = uncategorizedFunds.reduce((sum, item) => sum + item.marketValue, 0);
   const uncategorizedPct = totalMarketValue > EPS ? (uncategorizedValue / totalMarketValue) * 100 : 0;

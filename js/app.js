@@ -539,6 +539,31 @@ function openTrade(fundId, preset = {}) {
   });
 }
 
+/** 编辑已有交易记录：预填原值，保存时更新该笔 */
+function openEditTrade(fundId, tradeId) {
+  const fund = getFund(fundId);
+  if (!fund) return;
+  const trade = (fund.trades || []).find((item) => item.id === tradeId);
+  if (!trade) return;
+  showSheet({
+    title: '编辑交易',
+    subtitle: `${fund.name || fund.code} · 修改日期后净值将按当日重新匹配`,
+    body: views.tradeSheetBody(fund, metricsFor(fund), {
+      type: trade.type,
+      source: trade.source,
+      date: trade.date,
+      fee: trade.fee,
+      amount: trade.type === 'BUY' ? trade.amount : '',
+      shares: trade.type === 'SELL' ? trade.shares : '',
+      note: trade.note,
+      tierIndex: Number.isInteger(trade.tierIndex) ? trade.tierIndex : undefined,
+      nav: trade.nav,
+      editTradeId: trade.id
+    }),
+    tall: true
+  });
+}
+
 function handleAddFund(form) {
   const code = String(form.elements.code.value || '').trim();
   if (!isFundCode(code)) {
@@ -749,28 +774,36 @@ function handleTrade(form) {
   const type = form.elements.type.value === 'SELL' ? 'SELL' : 'BUY';
   const date = form.elements.date.value || todayISO();
   const source = form.elements.source?.value === 'ADD' ? 'ADD' : 'BASE';
+  const editId = String(form.elements.editId?.value || '');
+  const origDate = String(form.dataset.origDate || '');
+  const origNav = num(form.dataset.origNav);
 
-  // nav 自动查找：navHistory 命中该日期（或之前最近一个工作日） → 找不到 fallback fund.nav
-  const navInfo = (function resolveNavForDateInner(fund, dateStr) {
-    if (!fund) return null;
-    if (Array.isArray(fund.navHistory)) {
-      const hit = fund.navHistory.find((h) => h.date === dateStr);
-      if (hit) return { nav: hit.nav, date: hit.date };
-      const before = fund.navHistory
-        .filter((h) => h.date <= dateStr)
-        .sort((a, b) => b.date.localeCompare(a.date))[0];
-      if (before) return { nav: before.nav, date: before.date };
+  // nav 解析：编辑且日期未改 → 沿用原记录净值；否则按日期从 navHistory 查找（找不到 fallback fund.nav）
+  let nav = 0;
+  if (editId && date === origDate && origNav > 0) {
+    nav = origNav;
+  } else {
+    const navInfo = (function resolveNavForDateInner(fund, dateStr) {
+      if (!fund) return null;
+      if (Array.isArray(fund.navHistory)) {
+        const hit = fund.navHistory.find((h) => h.date === dateStr);
+        if (hit) return { nav: hit.nav, date: hit.date };
+        const before = fund.navHistory
+          .filter((h) => h.date <= dateStr)
+          .sort((a, b) => b.date.localeCompare(a.date))[0];
+        if (before) return { nav: before.nav, date: before.date };
+      }
+      if (fund.nav > 0) return { nav: fund.nav, date: fund.navDate || dateStr };
+      return null;
+    })(fund, date);
+
+    if (!navInfo || navInfo.nav <= 0) {
+      toast('暂无可用净值数据，请先刷新基金净值', 'error');
+      return;
     }
-    if (fund.nav > 0) return { nav: fund.nav, date: fund.navDate || dateStr };
-    return null;
-  })(fund, date);
-
-  if (!navInfo || navInfo.nav <= 0) {
-    toast('暂无可用净值数据，请先刷新基金净值', 'error');
-    return;
+    nav = navInfo.nav;
   }
 
-  const nav = navInfo.nav;
   let amount = 0;
   let shares = 0;
 
@@ -788,15 +821,42 @@ function handleTrade(form) {
       return;
     }
     amount = shares * nav;
-    // 卖出前校验份额
-    const metrics = metricsFor(fund);
-    if (shares > metrics.position.shares + 1e-6) {
-      toast('卖出份额超过当前持仓', 'error');
-      return;
+    // 卖出前校验份额（编辑时放宽：该笔本身已计入持仓，扣除自身后校验）
+    if (!editId) {
+      const metrics = metricsFor(fund);
+      if (shares > metrics.position.shares + 1e-6) {
+        toast('卖出份额超过当前持仓', 'error');
+        return;
+      }
     }
   }
 
   const tierIndexRaw = String(form.elements.tierIndex.value || '');
+  const note = String(form.elements.note.value || '').trim();
+  const tierIndex = tierIndexRaw === '' ? null : Number(tierIndexRaw);
+
+  if (editId) {
+    const trade = fund.trades.find((item) => item.id === editId);
+    if (!trade) {
+      toast('原交易记录不存在，可能已被删除', 'error');
+      return;
+    }
+    trade.type = type;
+    trade.date = date;
+    trade.nav = nav;
+    trade.amount = amount;
+    trade.shares = shares;
+    trade.fee = fee;
+    trade.note = note;
+    if (!Number.isInteger(trade.tierIndex) && form.elements.source) trade.source = source;
+
+    store.save(state);
+    hideSheet();
+    render();
+    toast('交易已更新', 'success');
+    return;
+  }
+
   const trade = {
     id: store.uid(),
     type,
@@ -806,8 +866,8 @@ function handleTrade(form) {
     shares,
     fee,
     source,
-    tierIndex: tierIndexRaw === '' ? null : Number(tierIndexRaw),
-    note: String(form.elements.note.value || '').trim(),
+    tierIndex,
+    note,
     closed: false,
     createdAt: Date.now()
   };
@@ -1244,6 +1304,9 @@ document.addEventListener('click', (event) => {
     case 'delete-trade':
       deleteTrade(target.dataset.fund, target.dataset.trade);
       break;
+    case 'edit-trade':
+      openEditTrade(target.dataset.fund, target.dataset.trade);
+      break;
     case 'export':
       handleExport();
       break;
@@ -1255,6 +1318,17 @@ document.addEventListener('click', (event) => {
     case 'remove-category':
       removeCategory(target.dataset.name);
       break;
+    case 'move-category': {
+      const idx = Number(target.dataset.index);
+      const dir = Number(target.dataset.dir);
+      const next = idx + dir;
+      if (!Number.isInteger(idx) || !Number.isInteger(dir)) break;
+      if (next < 0 || next >= state.categories.length) break;
+      const cats = state.categories;
+      [cats[idx], cats[next]] = [cats[next], cats[idx]];
+      commit();
+      break;
+    }
     case 'unassign-category': {
       const fund = getFund(target.dataset.fund);
       if (!fund) break;
@@ -1394,7 +1468,13 @@ document.addEventListener('change', (event) => {
     const sourceField = form.querySelector('[data-source-field]');
     if (sourceField) sourceField.hidden = type === 'SELL';
     const submitBtn = form.querySelector('button[type="submit"]');
-    if (submitBtn) submitBtn.textContent = type === 'SELL' ? '登记卖出' : '登记买入';
+    if (submitBtn) {
+      submitBtn.textContent = form.elements.editId?.value
+        ? '保存修改'
+        : type === 'SELL'
+          ? '登记卖出'
+          : '登记买入';
+    }
     updateTradeNavHint();
     return;
   }
@@ -1410,7 +1490,11 @@ function updateTradeNavHint() {
   const date = form.elements.date.value || todayISO();
 
   let navInfo = null;
-  if (Array.isArray(fund.navHistory)) {
+  // 编辑模式：日期未改时提示沿用原记录净值
+  if (form.dataset.origDate && date === form.dataset.origDate && num(form.dataset.origNav) > 0) {
+    navInfo = { nav: num(form.dataset.origNav), date, source: 'record' };
+  }
+  if (!navInfo && Array.isArray(fund.navHistory)) {
     const hit = fund.navHistory.find((h) => h.date === date);
     if (hit) navInfo = { nav: hit.nav, date: hit.date, source: 'history' };
     else {
@@ -1422,8 +1506,9 @@ function updateTradeNavHint() {
   }
   if (!navInfo && fund.nav > 0) navInfo = { nav: fund.nav, date: fund.navDate || date, source: 'latest' };
 
+  const sourceLabel = navInfo.source === 'record' ? '（原记录）' : navInfo.source === 'latest' ? '（最新）' : '';
   hint.innerHTML = navInfo
-    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${navInfo.source === 'latest' ? '（最新）' : ''}`
+    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${sourceLabel}`
     : '<b class="warn">⚠ 暂无净值数据，请先刷新或查询</b>';
 }
 

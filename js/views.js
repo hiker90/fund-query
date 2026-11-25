@@ -706,7 +706,8 @@ function tradesCard(metrics) {
                     ? `补仓${Number.isInteger(trade.tierIndex) ? ` · 第 ${trade.tierIndex + 1} 档` : ''}`
                     : '买入 · 底仓';
                 return `
-                <li class="trade-item">
+                <li class="trade-item" role="button" tabindex="0" data-action="edit-trade"
+                  data-fund="${esc(metrics.fund.id)}" data-trade="${esc(trade.id)}">
                   <div class="trade-left">
                     <span class="trade-dot ${isSell ? 'sell' : 'buy'}"></span>
                     <div>
@@ -765,6 +766,76 @@ function macroAdviceCard(metrics, macro) {
     </section>`;
 }
 
+/** 近一月净值走势卡：SVG 折线 + 面积，数据不足时显示空态 */
+function navChartCard(fund) {
+  const history = Array.isArray(fund.navHistory) ? fund.navHistory : [];
+  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const pts = history.filter((p) => p.date >= cutoff);
+
+  if (pts.length < 2) {
+    return `
+      <section class="card nav-chart">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">净值走势</h2>
+            <p class="card-sub">近一月</p>
+          </div>
+        </div>
+        <p class="empty-inline">走势数据不足，刷新净值后会自动积累。</p>
+      </section>`;
+  }
+
+  const W = 320;
+  const H = 110;
+  const PX = 6;
+  const PY = 12;
+  const t0 = pts[0].date;
+  const t1 = pts[pts.length - 1].date;
+  const t0n = Date.parse(t0);
+  const t1n = Date.parse(t1);
+  const navs = pts.map((p) => p.nav);
+  let min = Math.min(...navs);
+  let max = Math.max(...navs);
+  if (max - min < 1e-6) {
+    max = min * 1.001 + 0.001;
+    min = min * 0.999;
+  }
+  const span = Math.max(t1n - t0n, 86400000);
+  const xy = pts.map((p) => [
+    PX + ((Date.parse(p.date) - t0n) / span) * (W - 2 * PX),
+    PY + (1 - (p.nav - min) / (max - min)) * (H - 2 * PY)
+  ]);
+  const line = xy.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+  const lastPt = xy[xy.length - 1];
+  const areaPath =
+    `M ${xy[0][0].toFixed(1)} ${H - PY} ` +
+    xy.map(([x, y]) => `L ${x.toFixed(1)} ${y.toFixed(1)}`).join(' ') +
+    ` L ${lastPt[0].toFixed(1)} ${H - PY} Z`;
+  const dir = pts[pts.length - 1].nav >= pts[0].nav ? 'up' : 'down';
+  const chgPct = ((pts[pts.length - 1].nav / pts[0].nav - 1) * 100);
+
+  return `
+    <section class="card nav-chart">
+      <div class="card-head">
+        <div>
+          <h2 class="card-title">净值走势</h2>
+          <p class="card-sub">${fmtDate(t0)} → ${fmtDate(t1)} · 共 ${pts.length} 个净值点</p>
+        </div>
+        <strong class="num ${toneClass(chgPct)}">${fmtPct(chgPct, { signed: true })}</strong>
+      </div>
+      <svg class="nav-chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+        <path class="nav-chart-area ${dir}" d="${areaPath}" fill-opacity="0.08"/>
+        <polyline class="nav-chart-line ${dir}" points="${line}"/>
+        <circle class="nav-chart-dot ${dir}" cx="${lastPt[0].toFixed(1)}" cy="${lastPt[1].toFixed(1)}" r="3"/>
+      </svg>
+      <div class="nav-chart-foot">
+        <span>最低 <b class="num">${fmtNav(min)}</b></span>
+        <span>最高 <b class="num">${fmtNav(max)}</b></span>
+        <span>最新 <b class="num">${fmtNav(pts[pts.length - 1].nav)}</b></span>
+      </div>
+    </section>`;
+}
+
 export function detailPage(metrics, macro = null) {
   const { fund } = metrics;
   const hasPosition = metrics.avgCost > 0;
@@ -816,6 +887,7 @@ export function detailPage(metrics, macro = null) {
         ${hasPosition ? `<p class="detail-foot">补仓 ${addCount} 次 · 记录 ${(fund.trades || []).length} 笔</p>` : '<p class="detail-foot">登记首笔买入后开始计算成本与规则线</p>'}
       </section>
 
+      ${navChartCard(fund)}
       ${ASSET_KIND_LABELS[metrics.assetKind] ? macroAdviceCard(metrics, macro) : ruleLadder(metrics)}
       ${tiersCard(metrics)}
       ${simulatorCard(metrics)}
@@ -1533,11 +1605,17 @@ export function tradeSheetBody(fund, metrics, preset = {}) {
   const isSell = preset.type === 'SELL';
   const isBase = (preset.source || 'BASE') === 'BASE';
   const lockedSource = Number.isInteger(preset.tierIndex);
+  const editId = preset.editTradeId || '';
   const today = todayISO();
   const defaultDate = preset.date || today;
-  const navInfo = resolveNavForDate(fund, defaultDate);
+  // 编辑模式：日期未改时沿用原记录净值，避免反推成本被最新净值覆盖
+  const navInfo =
+    editId && preset.nav > 0
+      ? { nav: preset.nav, date: defaultDate, source: 'record' }
+      : resolveNavForDate(fund, defaultDate);
+  const navLabel = navInfo.source === 'record' ? '（原记录）' : navInfo.source === 'latest' ? '（最新）' : '';
   const navHint = navInfo
-    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${navInfo.source === 'latest' ? '（最新）' : ''}`
+    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${navLabel}`
     : '<b class="warn">⚠ 暂无净值数据，请先刷新或查询</b>';
 
   // 空基金（无份额且无交易记录）→ 只显示底仓登记（市值 + 收益率）
@@ -1560,8 +1638,13 @@ export function tradeSheetBody(fund, metrics, preset = {}) {
       </form>`;
   }
 
+  const submitText = editId ? '保存修改' : isSell ? '登记卖出' : '登记买入';
+
   return `
-    <form class="form" data-form="add-trade" data-fund="${esc(fund.id)}">
+    <form class="form" data-form="add-trade" data-fund="${esc(fund.id)}"${
+      editId ? ` data-orig-date="${esc(defaultDate)}" data-orig-nav="${preset.nav || ''}"` : ''
+    }>
+      ${editId ? `<input type="hidden" name="editId" value="${esc(editId)}">` : ''}
       ${
         lockedSource
           ? `<input type="hidden" name="source" value="${esc(preset.source || 'BASE')}">`
@@ -1598,7 +1681,7 @@ export function tradeSheetBody(fund, metrics, preset = {}) {
       </div>
 
       ${field({ label: '备注', name: 'note', value: preset.note || '', placeholder: '可选', inputmode: 'text' })}
-      <button class="btn primary block" type="submit">${isSell ? '登记卖出' : '登记买入'}</button>
+      <button class="btn primary block" type="submit">${submitText}</button>
     </form>`;
 }
 
@@ -1847,17 +1930,23 @@ export function allocationPage(state, metricsMap, expandedCats = new Set(), macr
         ? '⚠️ 目标合计远离 100%，建议调整'
         : '✓ 目标配置正常';
 
-  // 类别编辑表单行
+  // 类别编辑表单行（支持上下移动调整展示顺序）
   const categoryEditorRows = state.categories
     .map(
-      (cat) => `
+      (cat, i) => `
       <div class="cat-edit-row">
         <input type="text" name="cat-name" value="${esc(cat.name)}" placeholder="类别名，如 指数型"
           data-old-name="${esc(cat.name)}">
         <input type="text" name="cat-target" value="${esc(String(cat.targetPct))}"
           inputmode="decimal" placeholder="目标 %">
-        <button class="icon-btn small" type="button" data-action="remove-category"
-          data-name="${esc(cat.name)}" aria-label="删除该类别">✕</button>
+        <span class="cat-order-btns">
+          <button class="icon-btn small" type="button" data-action="move-category" data-index="${i}"
+            data-dir="-1" aria-label="上移"${i === 0 ? ' disabled' : ''}>↑</button>
+          <button class="icon-btn small" type="button" data-action="move-category" data-index="${i}"
+            data-dir="1" aria-label="下移"${i === state.categories.length - 1 ? ' disabled' : ''}>↓</button>
+          <button class="icon-btn small" type="button" data-action="remove-category"
+            data-name="${esc(cat.name)}" aria-label="删除该类别">✕</button>
+        </span>
       </div>`
     )
     .join('');
