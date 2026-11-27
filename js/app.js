@@ -6,11 +6,13 @@ import {
   computeFundMetrics,
   fundAssetKind,
   computeValuationLevel,
+  computeSipTrades,
   num,
   parseBatchText,
   resolveStrategyByKey,
   simulateAdd,
-  STRATEGY_KEYS
+  STRATEGY_KEYS,
+  todayISO as strategyTodayISO
 } from './strategy.js';
 import { fetchQuotes, fetchFundBasicInfo, isFundCode } from './quote.js';
 import { fetchMacroData, fetchKlineClose } from './macro.js';
@@ -220,6 +222,7 @@ function parseRoute() {
   const hash = String(location.hash || '').replace(/^#/, '');
   if (hash.startsWith('/fund/')) return { name: 'detail', id: hash.slice('/fund/'.length) };
   if (hash === '/holdings') return { name: 'holdings' };
+  if (hash === '/trades') return { name: 'trades' };
   if (hash === '/strategy') return { name: 'strategy' };
   if (hash === '/allocation') return { name: 'allocation' };
   if (hash === '/data') return { name: 'data' };
@@ -243,7 +246,8 @@ function updateTabs(route) {
   document.querySelectorAll('.tabbar a').forEach((link) => {
     const tab = link.dataset.tab;
     const active =
-      tab === route.name || (tab === 'holdings' && route.name === 'detail');
+      tab === route.name ||
+      (tab === 'holdings' && (route.name === 'detail' || route.name === 'trades'));
     link.classList.toggle('is-active', active);
     if (active) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
@@ -269,6 +273,9 @@ function render() {
     currentFundId = fund.id;
     app.innerHTML = views.detailPage(metricsFor(fund), macroData);
     ensureMacroForAdvice();
+  } else if (route.name === 'trades') {
+    currentFundId = null;
+    app.innerHTML = views.tradesPage(state, buildMetricsMap());
   } else if (route.name === 'strategy') {
     currentFundId = null;
     app.innerHTML = views.strategyPage(state);
@@ -364,6 +371,7 @@ async function refreshFunds(ids = null) {
     });
 
     store.save(state);
+    applySip();
     if (updated > 0) toast(`已更新 ${updated} 只基金的净值`, 'success');
     if (missing.length > 0) toast(`未取到 ${missing.join('、')} 的净值，可手动录入`, 'warn');
   } catch (error) {
@@ -381,6 +389,108 @@ function openAddFund() {
     body: views.addFundSheetBody(state.categories || []),
     tall: true
   });
+}
+
+/* ============================ 定投（SIP） ============================ */
+
+let sipWeekdayDraft = 1; // sheet 内临时选中的周几（1–5），确认时写入计划
+
+/** 执行定投：聚合模式 —— 待执行列表累加进 sip.totalShares/totalAmount/lastDate（不落逐笔 trades） */
+function applySip() {
+  const today = strategyTodayISO();
+  const sipFunds = state.funds.filter((fund) => fund.sip && fund.sip.enabled);
+  if (sipFunds.length === 0) return false;
+  let executedCount = 0;
+  let executedAmount = 0;
+
+  sipFunds.forEach((fund) => {
+    const sip = fund.sip;
+    const pending = computeSipTrades(fund, sip);
+    if (pending.length === 0) return;
+    pending.forEach((item) => {
+      sip.totalShares += item.shares;
+      sip.totalAmount += item.amount;
+      sip.lastDate = item.date;
+      executedCount += 1;
+      executedAmount += item.amount;
+    });
+  });
+
+  if (executedCount > 0) {
+    store.save(state);
+    const todayFunds = sipFunds.filter((fund) => fund.sip && fund.sip.lastDate === today);
+    if (todayFunds.length > 0) {
+      toast(`定投已执行：${todayFunds.map((f) => f.name || f.code).slice(0, 3).join('、')}${todayFunds.length > 3 ? ' 等' : ''}，共 ${executedCount} 期 ¥${Math.round(executedAmount)}`, 'success');
+    } else {
+      toast(`定投补记 ${executedCount} 期（累计 ¥${Math.round(executedAmount)}）`, 'success');
+    }
+    render();
+  }
+  return executedCount > 0;
+}
+
+function openSip(fundId) {
+  const fund = getFund(fundId);
+  if (!fund) return;
+  sipWeekdayDraft = fund.sip && fund.sip.enabled ? Number(fund.sip.weekday) || 1 : 1;
+  showSheet(views.sipSheet(fund, strategyTodayISO()));
+}
+
+function handleSip(form) {
+  const fund = getFund(form.dataset.fund);
+  if (!fund) return;
+  const freq = form.elements.freq.value === 'WEEKLY' ? 'WEEKLY' : 'DAILY';
+  const amount = num(form.elements.amount.value);
+  if (amount <= 0) {
+    toast('请填写有效的定投金额', 'error');
+    return;
+  }
+  const startDate = form.elements.startDate.value || strategyTodayISO();
+  const prev = fund.sip && fund.sip.enabled ? fund.sip : null;
+  // 更改策略（频率/金额/周几）自更改日生效：聚合累计与最近执行日原样保留，
+  // 之后的待执行期按新 amount/freq 计算，之前的买入记录不受影响。
+  fund.sip = {
+    enabled: true,
+    freq,
+    weekday: freq === 'WEEKLY' ? sipWeekdayDraft : 1,
+    amount,
+    startDate: prev && prev.startDate ? prev.startDate : startDate,
+    totalShares: prev ? prev.totalShares : 0,
+    totalAmount: prev ? prev.totalAmount : 0,
+    lastDate: prev ? prev.lastDate : ''
+  };
+  store.save(state);
+  hideSheet();
+  applySip();
+  render();
+  toast(prev ? '定投计划已更新，自下一执行期生效' : '定投计划已保存', 'success');
+}
+
+function stopSip(fundId) {
+  const fund = getFund(fundId);
+  if (!fund || !fund.sip) return;
+  const sip = fund.sip;
+  // 停止时把聚合累计转换为一条合成买入记录留在 trades（定投历史可追溯、持仓计算不变）
+  if (sip.totalAmount > 0 && sip.totalShares > 0) {
+    fund.trades.push({
+      id: store.uid(),
+      type: 'BUY',
+      date: sip.lastDate || sip.startDate || strategyTodayISO(),
+      nav: sip.totalAmount / sip.totalShares,
+      amount: sip.totalAmount,
+      shares: sip.totalShares,
+      fee: 0,
+      source: 'SIP',
+      tierIndex: null,
+      note: `定投累计（${sip.startDate || '—'} 至 ${sip.lastDate || '—'}）`,
+      closed: false,
+      createdAt: Date.now()
+    });
+  }
+  fund.sip = null;
+  store.save(state);
+  render();
+  toast('定投已停止，累计记录已并入交易记录', 'success');
 }
 
 let batchParsed = null;
@@ -441,10 +551,36 @@ async function confirmBatchImport() {
     const today = todayISO();
     const newFunds = [];
     const noNavCodes = [];
+    let patchedBaseCount = 0; // 已有基金补登记底仓的数量
 
     for (const row of rows) {
-      // 跳过已有基金
-      if (state.funds.some((f) => f.code === row.code)) continue;
+      const existing = state.funds.find((f) => f.code === row.code);
+      if (existing) {
+        // 已有基金：若无底仓记录则补登记底仓（净值优先用查询结果，回退基金当前净值）
+        const quote = quotes.get(row.code);
+        const nav = quote && quote.nav > 0 ? quote.nav : num(existing.nav);
+        const hasBase = (existing.trades || []).some((t) => t.type === 'BUY' && t.source === 'BASE');
+        if (!hasBase && nav > 0) {
+          const shares = row.amount / nav;
+          const cost = row.amount / (1 + row.returnPct / 100);
+          existing.trades.push({
+            id: store.uid(),
+            type: 'BUY',
+            date: today,
+            nav: cost / shares,
+            amount: cost,
+            shares,
+            fee: 0,
+            source: 'BASE',
+            tierIndex: null,
+            note: '批量导入底仓（补登记）',
+            closed: false,
+            createdAt: Date.now()
+          });
+          patchedBaseCount += 1;
+        }
+        continue;
+      }
       const quote = quotes.get(row.code);
       const nav = quote && quote.nav > 0 ? quote.nav : 0;
       const navDate = nav > 0 && quote.navDate ? quote.navDate : today;
@@ -514,9 +650,12 @@ async function confirmBatchImport() {
     render();
 
     const okCount = newFunds.length - noNavCodes.length;
-    let msg = `导入完成：${okCount} 只已登记底仓`;
-    if (noNavCodes.length) msg += `，${noNavCodes.length} 只（${noNavCodes.join('、')}）未查到净值，仅添加监控无底仓`;
-    toast(msg, okCount ? 'success' : 'warn');
+    const parts = [];
+    if (okCount) parts.push(`${okCount} 只新基金已登记底仓`);
+    if (patchedBaseCount) parts.push(`${patchedBaseCount} 只已有基金补登记底仓`);
+    let msg = parts.length ? `导入完成：${parts.join('，')}` : '导入完成：无新增（基金均已存在且有底仓）';
+    if (noNavCodes.length) msg += `，${noNavCodes.length} 只（${noNavCodes.join('、')}）未查到净值`;
+    toast(msg, okCount || patchedBaseCount ? 'success' : 'warn');
   } catch (error) {
     if (confirmBtn) {
       confirmBtn.disabled = false;
@@ -1102,9 +1241,10 @@ document.addEventListener('keydown', (event) => {
 });
 
 document.addEventListener('click', (event) => {
-  // sheet 里的筛选/排序 chip 点击处理（chip-option label）
+  // sheet 里的筛选/排序 chip 点击处理（chip-option label）。
+  // 注意：定投周几等自带 data-action 的 chip-option 走下方统一委托，此处只拦纯筛选 chip。
   const chip = event.target.closest('.chip-option');
-  if (chip) {
+  if (chip && !chip.dataset.action) {
     const group = chip.dataset.group;
     const value = chip.dataset.value;
     event.preventDefault();
@@ -1120,10 +1260,13 @@ document.addEventListener('click', (event) => {
     case 'close-sheet':
       hideSheet();
       break;
-    case 'back':
-      if (window.history.length > 1) window.history.back();
-      else location.hash = '#/holdings';
+    case 'back': {
+      // hash 路由不依赖浏览器历史（iOS Safari history.length 恒 ≥ 2，back 可能跳出应用）：
+      // 二级页（详情/交易明细）固定回持仓页，其余回宏观首页
+      const from = parseRoute().name;
+      location.hash = from === 'detail' || from === 'trades' ? '#/holdings' : '#/macro';
       break;
+    }
     case 'add-fund':
       openAddFund();
       break;
@@ -1307,6 +1450,34 @@ document.addEventListener('click', (event) => {
     case 'edit-trade':
       openEditTrade(target.dataset.fund, target.dataset.trade);
       break;
+    case 'open-trades':
+      location.hash = '#/trades';
+      break;
+    case 'open-sip':
+      openSip(target.dataset.fund);
+      break;
+    case 'stop-sip':
+      stopSip(target.dataset.fund);
+      break;
+    case 'pick-sip-weekday': {
+      sipWeekdayDraft = Number(target.dataset.day) || 1;
+      const group = target.closest('[data-action-group="sip-weekday"]');
+      if (group) {
+        group.querySelectorAll('.chip-option').forEach((el) => {
+          el.classList.toggle('is-on', el === target);
+        });
+      }
+      break;
+    }
+    case 'trades-filter':
+      views.setTradesFilterType(target.dataset.type);
+      render();
+      break;
+    case 'open-fund': {
+      const fundId = target.dataset.id || target.closest('[data-id]')?.dataset.id;
+      if (fundId) location.hash = `#/fund/${fundId}`;
+      break;
+    }
     case 'export':
       handleExport();
       break;
@@ -1367,6 +1538,9 @@ document.addEventListener('submit', (event) => {
       break;
     case 'categories':
       handleCategories(form);
+      break;
+    case 'save-sip':
+      handleSip(form);
       break;
     default:
       break;
@@ -1477,6 +1651,16 @@ document.addEventListener('change', (event) => {
     }
     updateTradeNavHint();
     return;
+  }
+  // 定投 sheet 每日/每周 segmented 切换
+  const sipToggle = event.target.closest('[data-toggle="sip-panel"]');
+  if (sipToggle) {
+    const form = document.querySelector('form[data-form="save-sip"]');
+    if (!form) return;
+    const freq = form.elements.freq.value;
+    form.querySelectorAll('[data-sip-panel]').forEach((panel) => {
+      panel.hidden = panel.dataset.sipPanel !== freq;
+    });
   }
 });
 
@@ -1600,6 +1784,9 @@ document.addEventListener('keydown', (event) => {
 });
 
 window.addEventListener('hashchange', render);
+
+// 启动时执行定投补记（净值已出的交易日自动补投；缺净值待刷新后自动补）
+applySip();
 
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   window.addEventListener('load', () => {

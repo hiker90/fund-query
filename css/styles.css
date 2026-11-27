@@ -1357,6 +1357,34 @@ a {
   padding-bottom: 0;
 }
 
+/* 交易明细页：按月分组标题 */
+.trade-month {
+  list-style: none;
+  padding: 14px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--line);
+}
+
+.trade-month:first-child {
+  padding-top: 0;
+}
+
+/* 明细列表整体（详情页 trade-list 是卡内 ul，明细页是独立列表卡） */
+.all-trades {
+  background: var(--card);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-top: 14px;
+  list-style: none;
+}
+
+.all-trades .trade-item[role='button']:active {
+  opacity: 0.6;
+}
+
 .trade-left {
   display: flex;
   align-items: center;
@@ -2407,6 +2435,26 @@ a {
 /* 交易记录可点击编辑 */
 .trade-item[role='button'] {
   cursor: pointer;
+}
+
+/* 定投计划卡 */
+.sip-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 16px;
+  margin: 12px 0 4px;
+  font-size: 13px;
+}
+
+.sip-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sip-summary span {
+  font-size: 12px;
+  color: var(--muted);
 }
 
 /* ---------- batch import ---------- */

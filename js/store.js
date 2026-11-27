@@ -9,7 +9,7 @@ import {
 } from './strategy.js';
 
 const STORAGE_KEY = 'fundpilot.v1';
-export const VERSION = 5;
+export const VERSION = 6;
 
 export function uid() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -31,6 +31,38 @@ function sanitizeAssetTargets(raw) {
     }
   }
   return targets;
+}
+
+/**
+ * 定投计划清洗：非法/空 → null（未启用）。
+ * v6 起定投不再逐笔落 trades，改为聚合累计：totalShares/totalAmount/lastDate。
+ * 历史字段缺失按 0/'' 补齐（迁移保证幂等）。
+ */
+function sanitizeSip(raw) {
+  if (!raw || typeof raw !== 'object' || raw.enabled !== true) return null;
+  const amount = Number(raw.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  const freq = raw.freq === 'WEEKLY' ? 'WEEKLY' : 'DAILY';
+  const weekdayRaw = Number(raw.weekday);
+  const weekday = Number.isInteger(weekdayRaw) && weekdayRaw >= 1 && weekdayRaw <= 5 ? weekdayRaw : 1;
+  const startDate = typeof raw.startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.startDate)
+    ? raw.startDate
+    : '';
+  const totalShares = Number(raw.totalShares);
+  const totalAmount = Number(raw.totalAmount);
+  const lastDate = typeof raw.lastDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.lastDate)
+    ? raw.lastDate
+    : '';
+  return {
+    enabled: true,
+    freq,
+    weekday,
+    amount,
+    startDate,
+    totalShares: Number.isFinite(totalShares) && totalShares > 0 ? totalShares : 0,
+    totalAmount: Number.isFinite(totalAmount) && totalAmount > 0 ? totalAmount : 0,
+    lastDate
+  };
 }
 
 export function defaultState() {
@@ -79,7 +111,7 @@ function sanitizeTrade(trade) {
     amount: num(trade.amount),
     shares: num(trade.shares),
     fee: num(trade.fee),
-    source: trade.source === 'ADD' ? 'ADD' : 'BASE',
+    source: ['ADD', 'SIP', 'MANUAL', 'AUTO'].includes(trade.source) ? trade.source : 'BASE',
     tierIndex: Number.isInteger(trade.tierIndex) ? trade.tierIndex : null,
     note: typeof trade.note === 'string' ? trade.note : '',
     closed: Boolean(trade.closed),
@@ -89,14 +121,13 @@ function sanitizeTrade(trade) {
 
 function sanitizeFund(fund) {
   if (!fund || typeof fund !== 'object') return null;
-  const trades = (Array.isArray(fund.trades) ? fund.trades : [])
+  let trades = (Array.isArray(fund.trades) ? fund.trades : [])
     .map(sanitizeTrade)
     .filter(Boolean);
   const navHistory = (Array.isArray(fund.navHistory) ? fund.navHistory : [])
     .map((item) => ({ date: String(item && item.date), nav: num(item && item.nav) }))
     .filter((item) => item.date && item.nav > 0)
     .sort((a, b) => a.date.localeCompare(b.date));
-
   // 策略覆盖清洗：字符串 ∈ NORMAL/AGGRESSIVE/NONE 保留，其余非法字符串 → null；
   // 旧对象型覆盖（非空）→ 预置 key（stopLossPct ≤ 10 → 'AGGRESSIVE'，否则 'NORMAL'）；
   // 空对象/null/缺失 → null（跟随全局）
@@ -122,6 +153,79 @@ function sanitizeFund(fund) {
   else if (rawClass === 'GOLD') assetClass = 'GOLD';
   else assetClass = classifyAssetClass(ftype);
 
+  // 底仓迁移（幂等）：基金没有任何 BASE 买入记录时，尝试从旧版 holdingBase 结构
+  // （{ source: 'TRADE'|'PNL', amount, pct, nav, date }）反推生成一条底仓交易，
+  // 保证交易明细 / 持仓成本对老数据可见。无法反推（字段缺失/非法）则保持空仓。
+  const hasBaseTrade = trades.some((t) => t.type === 'BUY' && t.source === 'BASE');
+  if (!hasBaseTrade) {
+    const hb = fund.holdingBase && typeof fund.holdingBase === 'object' ? fund.holdingBase : null;
+    const hbAmount = num(hb && hb.amount);
+    const hbPct = num(hb && hb.pct);
+    const hbNav = num(hb && hb.nav);
+    if (hb && hbAmount > 0) {
+      let baseShares = 0;
+      let baseCost = 0;
+      let baseNav = 0;
+      if ((hb.source || '') === 'PNL') {
+        // PNL：amount=当前市值，pct=收益率；成本 = 市值 / (1 + pct%)，份额用 holdingBase.nav 或最新 navHistory
+        const navForShares = hbNav > 0 ? hbNav : (navHistory.length ? navHistory[navHistory.length - 1].nav : 0);
+        if (navForShares > 0) {
+          baseCost = hbAmount / (1 + hbPct / 100);
+          baseShares = hbAmount / navForShares;
+          baseNav = baseCost / baseShares;
+        }
+      } else {
+        // TRADE：amount=投入本金，nav=成交净值
+        if (hbNav > 0) {
+          baseCost = hbAmount;
+          baseShares = hbAmount / hbNav;
+          baseNav = hbNav;
+        }
+      }
+      if (baseShares > 0 && baseNav > 0) {
+        trades.push({
+          id: uid(),
+          type: 'BUY',
+          date: typeof hb.date === 'string' && hb.date ? hb.date : (navHistory.length ? navHistory[0].date : ''),
+          nav: baseNav,
+          amount: baseCost,
+          shares: baseShares,
+          fee: num(hb.fee),
+          source: 'BASE',
+          tierIndex: null,
+          note: '底仓迁移（holdingBase 反推）',
+          closed: false,
+          createdAt: Date.now()
+        });
+      }
+    }
+  }
+
+  // 定投迁移（幂等）：v5 及以前定投逐笔落 trades（source='SIP'），v6 起聚合到 fund.sip
+  // 的 totalShares/totalAmount/lastDate 并从 trades 移除逐笔记录。
+  // 停用后转换的聚合 BUY 记录（source='SIP' 且无对应启用计划）保留在 trades 不动。
+  if (fund.sip && fund.sip.enabled === true) {
+    const sipTrades = trades.filter((t) => t.source === 'SIP');
+    if (sipTrades.length > 0) {
+      const aggAmount = sipTrades.reduce((sum, t) => sum + num(t.amount), 0);
+      const aggShares = sipTrades.reduce((sum, t) => sum + num(t.shares), 0);
+      const aggLastDate = sipTrades.reduce((latest, t) => (String(t.date) > latest ? String(t.date) : latest), '');
+      const sip = sanitizeSip(fund.sip);
+      // trades 为权威（逐笔已发生），聚合字段取两者较大者防重复迁移叠加
+      fund.sip = {
+        ...sip,
+        totalShares: Math.max(sip.totalShares, aggShares),
+        totalAmount: Math.max(sip.totalAmount, aggAmount),
+        lastDate: aggLastDate > sip.lastDate ? aggLastDate : sip.lastDate
+      };
+      trades = trades.filter((t) => t.source !== 'SIP');
+    } else {
+      fund.sip = sanitizeSip(fund.sip);
+    }
+  } else {
+    fund.sip = sanitizeSip(fund.sip);
+  }
+
   return {
     id: typeof fund.id === 'string' && fund.id ? fund.id : uid(),
     code: String(fund.code || '').trim(),
@@ -135,6 +239,7 @@ function sanitizeFund(fund) {
     ftype,
     strategyOverride,
     trades,
+    sip: fund.sip,
     tierState: Array.isArray(fund.tierState) ? fund.tierState.map(Boolean) : [],
     logicIntact: fund.logicIntact !== false
   };

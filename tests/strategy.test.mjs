@@ -12,6 +12,10 @@ import {
   computeValuationLevel,
   fundAssetKind,
   isOverseasFtype,
+  isWeekday,
+  nextSipDates,
+  computeSipTrades,
+  sipSyntheticTrade,
   recommendAssetScheme,
   resolveStrategyByKey,
   simulateAdd,
@@ -471,8 +475,8 @@ test('迁移 v4：FTYPE 含黄金/债券优先于原大类', () => {
   assert.equal(migrated.funds[1].assetClass, 'BOND');
 });
 
-test('迁移 v5：VERSION === 5 且幂等（同一数据重复迁移 deepEqual）', () => {
-  assert.equal(VERSION, 5);
+test('迁移 v6：VERSION === 6 且幂等（同一数据重复迁移 deepEqual）', () => {
+  assert.equal(VERSION, 6);
   const raw = {
     version: 3,
     funds: [
@@ -483,6 +487,209 @@ test('迁移 v5：VERSION === 5 且幂等（同一数据重复迁移 deepEqual�
   const first = normalizeState(raw);
   const second = normalizeState(first);
   assert.deepEqual(second, first);
+});
+
+test('定投：nextSipDates 每日模式跳过周末', () => {
+  // 2026-11-23 周一 ~ 2026-11-29 周日 → 工作日 23/24/25/26/27
+  const dates = nextSipDates(
+    { enabled: true, freq: 'DAILY', amount: 500 },
+    '2026-11-23',
+    '2026-11-29'
+  );
+  assert.deepEqual(dates, ['2026-11-23', '2026-11-24', '2026-11-25', '2026-11-26', '2026-11-27']);
+});
+
+test('定投：nextSipDates 每周模式只取指定周几', () => {
+  // 2026-11-23 周一 ~ 2026-11-29 周日，选周三(3) → 只有 11-25
+  const dates = nextSipDates(
+    { enabled: true, freq: 'WEEKLY', weekday: 3, amount: 500 },
+    '2026-11-23',
+    '2026-11-29'
+  );
+  assert.deepEqual(dates, ['2026-11-25']);
+});
+
+test('定投：nextSipDates 边界（空计划/日期倒序返回空数组）', () => {
+  assert.deepEqual(nextSipDates(null, '2026-11-01', '2026-11-30'), []);
+  assert.deepEqual(nextSipDates({ enabled: false, freq: 'DAILY' }, '2026-11-01', '2026-11-30'), []);
+  assert.deepEqual(
+    nextSipDates({ enabled: true, freq: 'DAILY' }, '2026-11-30', '2026-11-01'),
+    []
+  );
+});
+
+test('定投：computeSipTrades 只对有净值的交易日补投（节假日自动跳过）', () => {
+  // navHistory 缺 11-26（模拟节假日）→ 定投跳过该日
+  const fund = {
+    navHistory: [
+      { date: '2026-11-23', nav: 1.5 },
+      { date: '2026-11-24', nav: 1.52 },
+      { date: '2026-11-25', nav: 1.49 },
+      { date: '2026-11-27', nav: 1.51 }
+    ]
+  };
+  const trades = computeSipTrades(fund, { enabled: true, freq: 'DAILY', amount: 300, startDate: '2026-11-23', totalShares: 0, totalAmount: 0, lastDate: '' });
+  assert.deepEqual(
+    trades.map((t) => t.date),
+    ['2026-11-23', '2026-11-24', '2026-11-25', '2026-11-27'],
+    '应跳过无净值的 11-26'
+  );
+  // 首笔：300 元 @1.5 → 200 份
+  assert.ok(Math.abs(trades[0].shares - 200) < 1e-9);
+  assert.equal(trades[0].amount, 300);
+});
+
+test('定投：computeSipTrades 从最近执行日次日续投，不重复历史', () => {
+  const fund = {
+    navHistory: [
+      { date: '2026-11-23', nav: 1.5 },
+      { date: '2026-11-24', nav: 1.52 },
+      { date: '2026-11-25', nav: 1.49 }
+    ]
+  };
+  // 已定投到 11-24 → 只补 11-25
+  const trades = computeSipTrades(fund, { enabled: true, freq: 'DAILY', amount: 100, startDate: '2026-11-23', totalShares: 100, totalAmount: 150, lastDate: '2026-11-24' });
+  assert.deepEqual(trades.map((t) => t.date), ['2026-11-25']);
+});
+
+test('定投：computeSipTrades 起始日在净值区间之后返回空；无净值返回空', () => {
+  const fund = { navHistory: [{ date: '2026-11-20', nav: 1.5 }] };
+  assert.deepEqual(
+    computeSipTrades(fund, { enabled: true, freq: 'DAILY', amount: 100, startDate: '2026-11-25', lastDate: '' }),
+    []
+  );
+  assert.deepEqual(computeSipTrades({ navHistory: [] }, { enabled: true, freq: 'DAILY', amount: 100 }), []);
+});
+
+test('定投：sipSyntheticTrade 聚合合成 BUY，参与 computePosition 摊薄成本', () => {
+  const sip = { enabled: true, freq: 'DAILY', amount: 500, startDate: '2026-11-01', totalShares: 700, totalAmount: 1000, lastDate: '2026-11-20' };
+  const synth = sipSyntheticTrade(sip);
+  assert.ok(synth, '有累计应合成记录');
+  assert.equal(synth.type, 'BUY');
+  assert.equal(synth.source, 'SIP');
+  assert.equal(synth.amount, 1000);
+  assert.equal(synth.shares, 700);
+  assert.equal(synth.date, '2026-11-01');
+  assert.ok(Math.abs(synth.nav - 1000 / 700) < 1e-9);
+  // 合成记录 + 手动买入 → computePosition 的份额/成本正确合并
+  const position = computePosition([
+    { type: 'BUY', date: '2026-11-05', nav: 1.2, amount: 1200, shares: 1000, fee: 0, source: 'MANUAL' },
+    synth
+  ]);
+  assert.ok(Math.abs(position.shares - 1700) < 1e-9);
+  assert.ok(Math.abs(position.cost - 2200) < 1e-9);
+  // 无累计 → null
+  assert.equal(sipSyntheticTrade({ enabled: true, totalAmount: 0, totalShares: 0 }), null);
+  assert.equal(sipSyntheticTrade(null), null);
+});
+
+test('定投迁移：v5 逐笔 SIP 记录聚合进 sip 并从 trades 移除（幂等）', () => {
+  const migrated = normalizeState({
+    version: 5,
+    funds: [{
+      code: '110022',
+      nav: 1.5,
+      navHistory: [{ date: '2026-11-20', nav: 1.5 }],
+      trades: [
+        { type: 'BUY', date: '2026-11-10', nav: 1.5, amount: 500, shares: 333.3333, fee: 0, source: 'SIP' },
+        { type: 'BUY', date: '2026-11-11', nav: 1.6, amount: 500, shares: 312.5, fee: 0, source: 'SIP' },
+        { type: 'BUY', date: '2026-11-05', nav: 1.4, amount: 10000, shares: 7142.857, fee: 0, source: 'BASE' }
+      ],
+      sip: { enabled: true, freq: 'DAILY', amount: 500, startDate: '2026-11-10' }
+    }]
+  });
+  const fund = migrated.funds[0];
+  // 逐笔 SIP 已移除，BASE 保留
+  assert.equal(fund.trades.filter((t) => t.source === 'SIP').length, 0);
+  assert.equal(fund.trades.filter((t) => t.source === 'BASE').length, 1);
+  // 聚合累计 = Σ 逐笔
+  assert.ok(Math.abs(fund.sip.totalAmount - 1000) < 0.01);
+  assert.ok(Math.abs(fund.sip.totalShares - (333.3333 + 312.5)) < 0.01);
+  assert.equal(fund.sip.lastDate, '2026-11-11');
+  // 幂等：重复迁移不变
+  const again = normalizeState(migrated);
+  assert.deepEqual(again, migrated);
+});
+
+test('定投迁移：停用状态下的 SIP 合成 BUY 记录保留在 trades（不被误删）', () => {
+  const migrated = normalizeState({
+    version: 5,
+    funds: [{
+      code: '110022',
+      nav: 1.5,
+      trades: [
+        { type: 'BUY', date: '2026-11-10', nav: 1.5, amount: 1000, shares: 666.6667, fee: 0, source: 'SIP' }
+      ],
+      sip: null
+    }]
+  });
+  // 无启用计划 → 聚合记录是历史定投停用转换产物，保留
+  assert.equal(migrated.funds[0].trades.length, 1);
+  assert.equal(migrated.funds[0].trades[0].source, 'SIP');
+});
+
+test('底仓迁移：旧版 holdingBase（PNL）无 BASE 记录时自动补建交易', () => {
+  // 补仓后止损线应随新成本上移 → 前提是持仓成本可从迁移数据恢复
+  const migrated = normalizeState({
+    version: 3,
+    funds: [{
+      code: '110022',
+      nav: 1.5,
+      navHistory: [{ date: '2026-11-20', nav: 1.5 }],
+      holdingBase: { source: 'PNL', amount: 10500, pct: 5, nav: 1.5, date: '2026-10-01' }
+    }]
+  });
+  const base = migrated.funds[0].trades.find((t) => t.type === 'BUY' && t.source === 'BASE');
+  assert.ok(base, '应有补建的底仓记录');
+  // 成本 = 10500 / 1.05 = 10000；份额 = 10500 / 1.5 = 7000；nav = 10000/7000 ≈ 1.4286
+  assert.ok(Math.abs(base.amount - 10000) < 0.01);
+  assert.ok(Math.abs(base.shares - 7000) < 0.01);
+  assert.equal(base.date, '2026-10-01');
+});
+
+test('底仓迁移：holdingBase（TRADE）按投入本金 + 成交净值补建', () => {
+  const migrated = normalizeState({
+    version: 3,
+    funds: [{
+      code: '000961',
+      nav: 1.2,
+      holdingBase: { source: 'TRADE', amount: 12000, nav: 1.2, date: '2026-09-15' }
+    }]
+  });
+  const base = migrated.funds[0].trades.find((t) => t.type === 'BUY' && t.source === 'BASE');
+  assert.ok(base);
+  assert.ok(Math.abs(base.amount - 12000) < 0.01);
+  assert.ok(Math.abs(base.shares - 10000) < 0.01);
+  assert.equal(base.nav, 1.2);
+});
+
+test('底仓迁移幂等：已有 BASE 记录不重复补建；重复迁移结果一致', () => {
+  const withBase = normalizeState({
+    version: 5,
+    funds: [{
+      code: '110022',
+      nav: 1.5,
+      trades: [{ type: 'BUY', date: '2026-11-01', nav: 1.4, amount: 9000, shares: 6428, fee: 0, source: 'BASE' }],
+      holdingBase: { source: 'PNL', amount: 10500, pct: 5, nav: 1.5, date: '2026-10-01' }
+    }]
+  });
+  // 已有 BASE 记录 → holdingBase 被忽略，不产生第二笔底仓
+  const bases = withBase.funds[0].trades.filter((t) => t.type === 'BUY' && t.source === 'BASE');
+  assert.equal(bases.length, 1);
+  const again = normalizeState(withBase);
+  assert.deepEqual(again, withBase);
+});
+
+test('底仓迁移：holdingBase 缺失/非法时保持空仓（不造数据）', () => {
+  const migrated = normalizeState({
+    version: 5,
+    funds: [
+      { code: '110022', nav: 1.5, holdingBase: { source: 'PNL', amount: 0, pct: 5, nav: 1.5 } },
+      { code: '000961', nav: 1.2 }
+    ]
+  });
+  assert.equal(migrated.funds[0].trades.length, 0);
+  assert.equal(migrated.funds[1].trades.length, 0);
 });
 
 // ===== 今日关注聚合 summarizeAttention =====

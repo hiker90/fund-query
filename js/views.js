@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, STRATEGY_KEYS, cloneStrategyPreset, computeMacroAdvice, sparklineData, summarizeAttention } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, STRATEGY_KEYS, cloneStrategyPreset, computeMacroAdvice, sparklineData, summarizeAttention, SIP_WEEKDAYS } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -320,6 +320,12 @@ export function holdingsPage(state, metricsMap, { refreshing = false, filterStat
           <p class="eyebrow">FundPilot</p>
           <h1>持仓监控</h1>
         </div>
+        <button class="icon-btn" type="button" data-action="open-trades" aria-label="交易明细" title="交易明细">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 20h18"/>
+            <path d="M6 20v-6M11 20V9M16 20v-9M21 20V4"/>
+          </svg>
+        </button>
         <button class="icon-btn${refreshing ? ' is-busy' : ''}" type="button" data-action="refresh-all"
           ${refreshing ? 'disabled' : ''} aria-label="刷新全部净值">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -365,6 +371,157 @@ export function holdingsPage(state, metricsMap, { refreshing = false, filterStat
 }
 
 /** 两个 metrics 的通用比较器 */
+/** 交易明细页：全部基金交易按时间倒序一览，支持买入/卖出筛选与按月分组 */
+let tradesFilterType = 'ALL'; // 'ALL' | 'BUY' | 'SELL'
+
+export function setTradesFilterType(type) {
+  tradesFilterType = ['ALL', 'BUY', 'SELL'].includes(type) ? type : 'ALL';
+}
+
+export function tradesPage(state, metricsMap) {
+  const funds = state.funds || [];
+
+  // 汇总全部交易记录（带基金信息）
+  const allTrades = [];
+  funds.forEach((fund) => {
+    (fund.trades || []).forEach((trade) => {
+      allTrades.push({ trade, fund });
+    });
+    // 进行中的定投以一条聚合记录参与明细与汇总（累计不落逐笔）
+    const sip = fund.sip;
+    if (sip && sip.enabled && sip.totalAmount > 0 && sip.totalShares > 0) {
+      allTrades.push({
+        trade: {
+          type: 'BUY',
+          date: sip.lastDate || sip.startDate || '',
+          nav: sip.totalAmount / sip.totalShares,
+          amount: sip.totalAmount,
+          shares: sip.totalShares,
+          fee: 0,
+          source: 'SIP',
+          note: `定投累计（${sip.startDate || '—'} 至 ${sip.lastDate || '—'}）`,
+          createdAt: 0
+        },
+        fund
+      });
+    }
+  });
+  // 时间倒序（同日按创建时间倒序）
+  allTrades.sort((a, b) => {
+    const diff = String(b.trade.date || '').localeCompare(String(a.trade.date || ''));
+    return diff !== 0 ? diff : num(b.trade.createdAt) - num(a.trade.createdAt);
+  });
+
+  const filtered =
+    tradesFilterType === 'ALL' ? allTrades : allTrades.filter((item) => item.trade.type === tradesFilterType);
+
+  // 统计
+  let buyAmount = 0;
+  let sellAmount = 0;
+  let buyCount = 0;
+  let sellCount = 0;
+  allTrades.forEach(({ trade }) => {
+    if (trade.type === 'SELL') {
+      sellAmount += trade.amount;
+      sellCount += 1;
+    } else {
+      buyAmount += trade.amount;
+      buyCount += 1;
+    }
+  });
+
+  // 类型筛选 tab
+  const tabs = [
+    { key: 'ALL', label: '全部', count: allTrades.length },
+    { key: 'BUY', label: '买入', count: buyCount },
+    { key: 'SELL', label: '卖出', count: sellCount }
+  ];
+  const tabBar = `
+    <div class="filter-tabs">
+      ${tabs
+        .map(
+          (t) => `<button type="button" class="filter-tab${tradesFilterType === t.key ? ' is-active' : ''}"
+            data-action="trades-filter" data-type="${t.key}">${t.label}<em>${t.count}</em></button>`
+        )
+        .join('')}
+    </div>`;
+
+  // 按月分组渲染
+  let lastMonth = '';
+  const rows = filtered.map(({ trade, fund }) => {
+    const month = String(trade.date || '').slice(0, 7); // YYYY-MM
+    const monthHeader =
+      month !== lastMonth
+        ? `<li class="trade-month"><span>${esc(month.replace('-', ' 年 '))} 月</span></li>`
+        : '';
+    lastMonth = month;
+    const isSell = trade.type === 'SELL';
+    const sourceLabel = isSell
+      ? '卖出'
+      : trade.source === 'ADD'
+        ? `补仓${Number.isInteger(trade.tierIndex) ? ` · 第 ${trade.tierIndex + 1} 档` : ''}`
+        : trade.source === 'SIP'
+          ? '定投买入'
+          : '买入 · 底仓';
+    return `${monthHeader}
+      <li class="trade-item" role="button" tabindex="0" data-action="open-fund" data-id="${esc(fund.id)}">
+        <div class="trade-left">
+          <span class="trade-dot ${isSell ? 'sell' : 'buy'}"></span>
+          <div>
+            <b>${esc(fund.name || fund.code)}</b>
+            <small>${esc(fund.code)} · ${esc(sourceLabel)} · 净值 ${fmtNav(trade.nav)}${trade.fee ? ` · 费 ${fmtMoney(trade.fee)}` : ''}</small>
+            ${trade.note ? `<small class="trade-note">${esc(trade.note)}</small>` : ''}
+          </div>
+        </div>
+        <div class="trade-right">
+          <b class="num ${isSell ? 'sell' : ''}">${isSell ? '-' : '+'}${fmtMoney(trade.amount)}</b>
+          <small class="num">${fmtDate(trade.date)} · ${fmtShares(trade.shares)} 份</small>
+        </div>
+      </li>`;
+  });
+
+  return `
+    <header class="topbar">
+      <div class="topbar-row">
+        <button class="icon-btn" type="button" data-action="back" aria-label="返回">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 18l-6-6 6-6"/>
+          </svg>
+        </button>
+        <div class="topbar-title">
+          <h1>交易明细</h1>
+          <p>全部基金 · 按时间倒序</p>
+        </div>
+        <span class="icon-btn" style="visibility:hidden" aria-hidden="true"></span>
+      </div>
+    </header>
+    <main class="page">
+      <section class="hero-card">
+        <p class="hero-label">累计投入 / 卖出回收</p>
+        <strong class="hero-value num">¥ ${fmtMoney(buyAmount)}</strong>
+        <div class="hero-chips">
+          <div>
+            <span>卖出回收</span>
+            <b class="num">¥ ${fmtMoney(sellAmount)}</b>
+          </div>
+          <div>
+            <span>净投入</span>
+            <b class="num">¥ ${fmtMoney(buyAmount - sellAmount)}</b>
+          </div>
+        </div>
+        <p class="hero-note">买入 ${buyCount} 笔 · 卖出 ${sellCount} 笔</p>
+      </section>
+
+      ${tabBar}
+      ${
+        rows.length
+          ? `<ul class="trade-list all-trades">${rows.join('')}</ul>`
+          : `<div class="empty-state compact"><p>${tradesFilterType === 'ALL' ? '还没有任何交易记录' : `没有${tradesFilterType === 'BUY' ? '买入' : '卖出'}记录`}</p></div>`
+      }
+      <p class="footnote">点击任意记录可进入对应基金详情。</p>
+    </main>`;
+}
+
 function compareMetrics(a, b, sortBy, sortDir) {
   const dir = sortDir === 'desc' ? -1 : 1;
   let cmp = 0;
@@ -730,6 +887,87 @@ function tradesCard(metrics) {
     </section>`;
 }
 
+/** 详情页定投计划卡 */
+function sipCard(metrics) {
+  const { fund } = metrics;
+  const sip = fund.sip;
+  if (!sip || !sip.enabled) {
+    return `
+      <section class="card sip-card">
+        <div class="card-head">
+          <div>
+            <h2 class="card-title">定投计划</h2>
+            <p class="card-sub">未启用 · 按交易日自动买入，节假日跳过</p>
+          </div>
+        </div>
+        <div class="button-grid">
+          <button class="btn ghost" type="button" data-action="open-sip" data-fund="${esc(fund.id)}">设置定投</button>
+        </div>
+      </section>`;
+  }
+  const freqLabel = sip.freq === 'WEEKLY'
+    ? `每周${(SIP_WEEKDAYS.find((d) => d.value === Number(sip.weekday)) || SIP_WEEKDAYS[0]).label}`
+    : '每日';
+  const sipCount = num(sip.totalAmount) > 0 && num(sip.amount) > 0
+    ? Math.round((num(sip.totalAmount) / num(sip.amount)) * 10) / 10
+    : 0;
+  return `
+    <section class="card sip-card">
+      <div class="card-head">
+        <div>
+          <h2 class="card-title">定投计划</h2>
+          <p class="card-sub">进行中 · 交易日自动买入 · 改动自下期生效</p>
+        </div>
+        <span class="badge tone-ok">进行中</span>
+      </div>
+      <div class="sip-summary">
+        <div><span>频率</span><b>${esc(freqLabel)}</b></div>
+        <div><span>每期金额</span><b class="num">¥ ${fmtMoney(sip.amount)}</b></div>
+        <div><span>累计定投</span><b class="num">¥ ${fmtMoney(sip.totalAmount || 0)}</b></div>
+        <div><span>累计份额</span><b class="num">${fmtMoney(sip.totalShares || 0)} 份</b></div>
+        <div><span>最近执行</span><b>${esc(sip.lastDate || '尚未执行')}</b></div>
+        <div><span>起始日</span><b>${esc(sip.startDate || '—')}</b></div>
+      </div>
+      <div class="button-grid">
+        <button class="btn ghost" type="button" data-action="open-sip" data-fund="${esc(fund.id)}">编辑计划</button>
+        <button class="btn ghost danger-text" type="button" data-action="stop-sip" data-fund="${esc(fund.id)}">停止定投</button>
+      </div>
+    </section>`;
+}
+
+/** 定投设置 sheet */
+function sipSheetBody(fund, today) {
+  const sip = fund.sip && fund.sip.enabled ? fund.sip : { freq: 'DAILY', weekday: 1, amount: '', startDate: today };
+  const isWeekly = sip.freq === 'WEEKLY';
+  return `
+    <form class="form" data-form="save-sip" data-fund="${esc(fund.id)}">
+      <p class="hint">启用后每次刷新会自动为已出净值的交易日补记定投买入（周末与节假日自动跳过）。</p>
+      <div class="segmented">
+        <label><input type="radio" name="freq" value="DAILY" ${isWeekly ? '' : 'checked'} data-toggle="sip-panel"><span>每日</span></label>
+        <label><input type="radio" name="freq" value="WEEKLY" ${isWeekly ? 'checked' : ''} data-toggle="sip-panel"><span>每周</span></label>
+      </div>
+      <div data-sip-panel="WEEKLY" ${isWeekly ? '' : 'hidden'}>
+        <div class="chip-row" data-action-group="sip-weekday">
+          ${SIP_WEEKDAYS.map((d) => `
+            <button type="button" class="chip-option tone-accent${Number(sip.weekday) === d.value ? ' is-on' : ''}"
+              data-action="pick-sip-weekday" data-day="${d.value}">${d.label}</button>`).join('')}
+        </div>
+      </div>
+      ${field({ label: '每期金额（元）', name: 'amount', value: sip.amount || '', placeholder: '500' })}
+      ${field({ label: '起始日期', name: 'startDate', value: sip.startDate || today, type: 'date', inputmode: 'none' })}
+      <button class="btn primary block" type="submit">保存定投计划</button>
+    </form>`;
+}
+
+export function sipSheet(fund, today) {
+  return {
+    title: '定投计划',
+    subtitle: `${fund.name || fund.code} · 周末与节假日自动跳过`,
+    body: sipSheetBody(fund, today),
+    tall: false
+  };
+}
+
 function manageCard(metrics) {
   const { fund } = metrics;
   const lockedKind = Boolean(ASSET_KIND_LABELS[metrics.assetKind]); // 锁定类基金隐藏策略入口
@@ -888,6 +1126,7 @@ export function detailPage(metrics, macro = null) {
       </section>
 
       ${navChartCard(fund)}
+      ${sipCard(metrics)}
       ${ASSET_KIND_LABELS[metrics.assetKind] ? macroAdviceCard(metrics, macro) : ruleLadder(metrics)}
       ${tiersCard(metrics)}
       ${simulatorCard(metrics)}

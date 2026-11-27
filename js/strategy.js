@@ -131,6 +131,103 @@ export function todayISO() {
   return `${now.getFullYear()}-${month}-${day}`;
 }
 
+/* ============================ 定投（SIP） ============================ */
+
+export const SIP_WEEKDAYS = Object.freeze([
+  { value: 1, label: '周一' },
+  { value: 2, label: '周二' },
+  { value: 3, label: '周三' },
+  { value: 4, label: '周四' },
+  { value: 5, label: '周五' }
+]);
+
+/** 日期字符串 → 是否工作日（周一~周五；节假日靠净值缺失兜底过滤） */
+export function isWeekday(dateStr) {
+  const day = new Date(`${dateStr}T12:00:00`).getDay();
+  return day >= 1 && day <= 5;
+}
+
+/**
+ * 生成 [fromDate, toDate] 闭区间内某定投计划应执行的全部交易日（YYYY-MM-DD 升序）。
+ * 每日 → 区间内全部工作日；每周 → 区间内指定 weekday 的工作日（weekday ∈ 1–5）。
+ */
+export function nextSipDates(sip, fromDate, toDate) {
+  if (!sip || !sip.enabled || !fromDate || !toDate || fromDate > toDate) return [];
+  const dates = [];
+  const cursor = new Date(`${fromDate}T12:00:00`);
+  const end = new Date(`${toDate}T12:00:00`);
+  while (cursor <= end) {
+    const iso = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}-${String(cursor.getDate()).padStart(2, '0')}`;
+    if (isWeekday(iso) && (sip.freq !== 'WEEKLY' || cursor.getDay() === Number(sip.weekday))) {
+      dates.push(iso);
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dates;
+}
+
+/**
+ * 计算某基金待执行的定投列表（v6 聚合模式：调用方累加进 sip.totalShares/totalAmount/lastDate）：
+ * - 起点 = max(计划起始日, 最近执行日次日, navHistory 首日)；从未执行过 → 从计划起始日起
+ * - 终点 = navHistory 最后一个净值日（今天净值未出则天然跳过，待下次执行时补投）
+ * - 仅对「当日有净值」的日期生成（法定节假日无净值自动跳过；周末被 nextSipDates 过滤）
+ * - amount 统一取 sip.amount（当前计划金额），策略更改自更改日之后生效
+ * 返回 [{ date, nav, amount, shares }]（升序）
+ */
+export function computeSipTrades(fund, sip) {
+  if (!sip || !sip.enabled || !(sip.amount > 0)) return [];
+  const history = (Array.isArray(fund.navHistory) ? fund.navHistory : [])
+    .filter((item) => item && item.date && item.nav > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  if (history.length === 0) return [];
+
+  const navMap = new Map(history.map((item) => [item.date, item.nav]));
+  const firstNavDate = history[0].date;
+  const lastNavDate = history[history.length - 1].date;
+  const startCandidates = [sip.startDate || firstNavDate, firstNavDate];
+  if (sip.lastDate) startCandidates.push(nextDay(sip.lastDate));
+  const fromDate = startCandidates.sort()[Math.max(0, startCandidates.length - 1)];
+  if (fromDate > lastNavDate) return [];
+
+  return nextSipDates(sip, fromDate, lastNavDate)
+    .filter((date) => navMap.has(date))
+    .map((date) => ({
+      date,
+      nav: navMap.get(date),
+      amount: sip.amount,
+      shares: sip.amount / navMap.get(date)
+    }));
+}
+
+/**
+ * 定投聚合 → 一条合成 BUY 交易（用于 computePosition 计算份额/摊薄成本）。
+ * date 取计划起始日（最早），保证之后任何卖出的均价扣减都包含定投成本；
+ * 无累计（totalAmount ≤ 0）返回 null。
+ */
+export function sipSyntheticTrade(sip) {
+  if (!sip || !sip.enabled || !(sip.totalAmount > 0) || !(sip.totalShares > 0)) return null;
+  return {
+    type: 'BUY',
+    date: sip.startDate || sip.lastDate || '',
+    nav: sip.totalAmount / sip.totalShares,
+    amount: sip.totalAmount,
+    shares: sip.totalShares,
+    fee: 0,
+    source: 'SIP',
+    createdAt: 0
+  };
+}
+
+/** YYYY-MM-DD 的次日 */
+function nextDay(dateStr) {
+  const date = new Date(`${dateStr}T12:00:00`);
+  date.setDate(date.getDate() + 1);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+
 /**
  * 按时间顺序回放交易，计算剩余份额、摊薄成本、已实现收益。
  * 摊薄成本 =（累计买入金额 + 买入手续费 − 卖出对应成本）/ 剩余份额
@@ -197,7 +294,9 @@ export function computeFundMetrics(fund, defaultStrategy, customStrategies) {
   const assetKind = fundAssetKind(fund);
   // v1.18 起债券/黄金/海外权益基金不适用分档策略，strategy 强制 null（status 恒 'none'）
   const strategy = assetKind === 'EQUITY' ? resolveStrategyByKey(defaultStrategy, fund && fund.strategyOverride, customStrategies) : null;
-  const position = computePosition(fund.trades);
+  // v6 定投聚合：合成一条 BUY 参与份额/成本计算（定投累计不落 trades，体积恒定）
+  const sipTrade = sipSyntheticTrade(fund.sip);
+  const position = computePosition(sipTrade ? [...(fund.trades || []), sipTrade] : fund.trades);
   const nav = num(fund.nav);
   const avgCost = position.avgCost;
   const tierAnchor = position.baseCost > EPS ? position.baseCost : avgCost;
