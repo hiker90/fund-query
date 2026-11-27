@@ -229,11 +229,78 @@ function nextDay(dateStr) {
 
 
 /**
+ * 解析交易日期对应的净值口径（当日净值未更新 → 记录暂存）。
+ * - navHistory 当日有净值（或 fund.navDate 即当日）→ 按当日净值确认
+ * - 日期早于净值历史最早日（回填老交易）→ 用此前最近净值兜底确认（老口径不变）
+ * - 其余（当日/未来净值尚未公布）→ pending: true，nav 为 0，待净值更新后结算
+ * 纯函数：非法输入返回 pending。
+ */
+export function resolveTradeNav(fund, dateStr) {
+  if (!fund || !dateStr) return { nav: 0, date: dateStr || '', source: '', pending: true };
+  const history = (Array.isArray(fund.navHistory) ? fund.navHistory : [])
+    .filter((h) => h && h.date && num(h.nav) > 0);
+  const hit = history.find((h) => h.date === dateStr);
+  if (hit) return { nav: num(hit.nav), date: hit.date, source: 'history', pending: false };
+  if (fund.navDate === dateStr && num(fund.nav) > 0) {
+    return { nav: num(fund.nav), date: dateStr, source: 'latest', pending: false };
+  }
+  const earliest = history.length ? history[0].date : '';
+  if (earliest && dateStr < earliest) {
+    const before = history
+      .filter((h) => h.date <= dateStr)
+      .sort((a, b) => b.date.localeCompare(a.date))[0];
+    if (before) return { nav: num(before.nav), date: before.date, source: 'history', pending: false };
+    if (num(fund.nav) > 0) return { nav: num(fund.nav), date: fund.navDate || dateStr, source: 'latest', pending: false };
+    return { nav: 0, date: dateStr, source: '', pending: true };
+  }
+  if (fund.navDate && dateStr < fund.navDate && num(fund.nav) > 0) {
+    return { nav: num(fund.nav), date: fund.navDate, source: 'latest', pending: false };
+  }
+  // 当日（或更晚）净值未更新 → 暂存，待净值到达后以当日净值生成记录
+  return { nav: 0, date: dateStr, source: 'pending', pending: true };
+}
+
+/**
+ * 结算暂存交易（净值更新后调用）：
+ * 对每笔 pending 交易，取 navHistory 中首个 date ≥ 交易日 的净值
+ * （当日净值已出 → 当日净值；周末/节假日交易 → 下一交易日净值确认）。
+ * BUY：shares = amount ÷ 净值；SELL：amount = shares × 净值。
+ * 无可用净值的 pending 交易保持暂存。
+ * 纯函数：返回 { trades, settledCount }，不修改入参。
+ */
+export function settlePendingTrades(fund) {
+  const trades = Array.isArray(fund && fund.trades) ? fund.trades : [];
+  const history = (Array.isArray(fund && fund.navHistory) ? fund.navHistory : [])
+    .filter((h) => h && h.date && num(h.nav) > 0)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  let settledCount = 0;
+  const next = trades.map((trade) => {
+    if (!trade || !trade.pending) return trade;
+    const target = history.find((h) => h.date >= String(trade.date || ''));
+    if (!target) return trade;
+    const nav = num(target.nav);
+    if (!(nav > 0)) return trade;
+    settledCount += 1;
+    const settled = { ...trade, nav, pending: false };
+    if (trade.type === 'SELL') {
+      settled.amount = num(trade.shares) * nav;
+    } else {
+      settled.shares = num(trade.amount) / nav;
+    }
+    return settled;
+  });
+  return { trades: next, settledCount };
+}
+
+/**
  * 按时间顺序回放交易，计算剩余份额、摊薄成本、已实现收益。
  * 摊薄成本 =（累计买入金额 + 买入手续费 − 卖出对应成本）/ 剩余份额
+ * pending（净值未更新暂存）的交易不参与持仓计算。
  */
 export function computePosition(trades = []) {
-  const list = [...trades].sort((a, b) => {
+  const list = trades
+    .filter((t) => !(t && t.pending))
+    .sort((a, b) => {
     const dateDiff = String(a.date || '').localeCompare(String(b.date || ''));
     return dateDiff !== 0 ? dateDiff : num(a.createdAt) - num(b.createdAt);
   });
@@ -310,7 +377,7 @@ export function computeFundMetrics(fund, defaultStrategy, customStrategies) {
     return num(trade.nav) > EPS ? num(trade.amount) / num(trade.nav) : 0;
   };
   const todayBuys = (fund.trades || []).filter(
-    (trade) => trade.type === 'BUY' && trade.date === todayIso
+    (trade) => trade.type === 'BUY' && trade.date === todayIso && !trade.pending
   );
   const todayShares = todayBuys.reduce((sum, trade) => sum + Math.max(sharesOfTrade(trade), 0), 0);
   const todayNavValue = todayBuys.reduce(
@@ -370,7 +437,7 @@ export function computeFundMetrics(fund, defaultStrategy, customStrategies) {
   else if (nearStop) status = 'nearStop';
 
   const addBatches = (fund.trades || [])
-    .filter((trade) => trade.type === 'BUY' && trade.source === 'ADD' && !trade.closed)
+    .filter((trade) => trade.type === 'BUY' && trade.source === 'ADD' && !trade.closed && !trade.pending)
     .map((trade) => {
       const buyNav = num(trade.nav);
       const returnPct = buyNav > EPS && nav > 0 ? (nav / buyNav - 1) * 100 : 0;

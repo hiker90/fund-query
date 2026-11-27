@@ -10,6 +10,8 @@ import {
   num,
   parseBatchText,
   resolveStrategyByKey,
+  resolveTradeNav,
+  settlePendingTrades,
   simulateAdd,
   STRATEGY_KEYS,
   todayISO as strategyTodayISO
@@ -329,9 +331,16 @@ function normalizeTierState(fund) {
   fund.tierState = Array.from({ length: tiers }, (_, index) => Boolean(current[index]));
 }
 
+/** 结算某基金的暂存交易（净值到达后按当日净值确认）；返回结算笔数 */
+function settleFundPending(fund) {
+  const { trades, settledCount } = settlePendingTrades(fund);
+  if (settledCount > 0) fund.trades = trades;
+  return settledCount;
+}
+
 function applyQuote(fund, quote) {
   if (quote.name) fund.name = quote.name;
-  if (!(quote.nav > 0)) return;
+  if (!(quote.nav > 0)) return 0;
   fund.nav = quote.nav;
   fund.navDate = quote.navDate || fund.navDate;
   fund.navUpdatedAt = Date.now();
@@ -342,6 +351,8 @@ function applyQuote(fund, quote) {
   else history.push({ date: fund.navDate, nav: quote.nav });
   history.sort((a, b) => a.date.localeCompare(b.date));
   fund.navHistory = history.slice(-365);
+  // 净值到达后自动确认暂存交易（以当日净值生成记录）
+  return settleFundPending(fund);
 }
 
 async function refreshFunds(ids = null) {
@@ -359,6 +370,7 @@ async function refreshFunds(ids = null) {
     const quotes = await fetchQuotes(funds.map((fund) => fund.code));
     const missing = [];
     let updated = 0;
+    let settled = 0;
 
     funds.forEach((fund) => {
       const quote = quotes.get(fund.code);
@@ -366,13 +378,14 @@ async function refreshFunds(ids = null) {
         missing.push(fund.code);
         return;
       }
-      applyQuote(fund, quote);
+      settled += applyQuote(fund, quote);
       updated += 1;
     });
 
     store.save(state);
     applySip();
     if (updated > 0) toast(`已更新 ${updated} 只基金的净值`, 'success');
+    if (settled > 0) toast(`已按当日净值确认 ${settled} 笔暂存交易`, 'success');
     if (missing.length > 0) toast(`未取到 ${missing.join('、')} 的净值，可手动录入`, 'warn');
   } catch (error) {
     toast(`刷新失败：${error.message}`, 'error');
@@ -917,30 +930,19 @@ function handleTrade(form) {
   const origDate = String(form.dataset.origDate || '');
   const origNav = num(form.dataset.origNav);
 
-  // nav 解析：编辑且日期未改 → 沿用原记录净值；否则按日期从 navHistory 查找（找不到 fallback fund.nav）
+  // nav 解析：编辑且日期未改 → 沿用原记录净值；否则按 resolveTradeNav 统一口径。
+  // 当日净值尚未公布 → 记录暂存（pending），净值更新后以当日净值自动确认
   let nav = 0;
+  let pending = false;
   if (editId && date === origDate && origNav > 0) {
     nav = origNav;
   } else {
-    const navInfo = (function resolveNavForDateInner(fund, dateStr) {
-      if (!fund) return null;
-      if (Array.isArray(fund.navHistory)) {
-        const hit = fund.navHistory.find((h) => h.date === dateStr);
-        if (hit) return { nav: hit.nav, date: hit.date };
-        const before = fund.navHistory
-          .filter((h) => h.date <= dateStr)
-          .sort((a, b) => b.date.localeCompare(a.date))[0];
-        if (before) return { nav: before.nav, date: before.date };
-      }
-      if (fund.nav > 0) return { nav: fund.nav, date: fund.navDate || dateStr };
-      return null;
-    })(fund, date);
-
-    if (!navInfo || navInfo.nav <= 0) {
-      toast('暂无可用净值数据，请先刷新基金净值', 'error');
-      return;
+    const navInfo = resolveTradeNav(fund, date);
+    if (navInfo.pending) {
+      pending = true;
+    } else {
+      nav = navInfo.nav;
     }
-    nav = navInfo.nav;
   }
 
   let amount = 0;
@@ -952,14 +954,16 @@ function handleTrade(form) {
       toast('请填写有效的买入金额', 'error');
       return;
     }
-    shares = amount / nav;
+    // 暂存：份额待净值更新后按当日净值计算
+    shares = pending ? 0 : amount / nav;
   } else {
     shares = num(form.elements.shares.value);
     if (shares <= 0) {
       toast('请填写有效的卖出份额', 'error');
       return;
     }
-    amount = shares * nav;
+    // 暂存：卖出金额待净值更新后按当日净值计算
+    amount = pending ? 0 : shares * nav;
     // 卖出前校验份额（编辑时放宽：该笔本身已计入持仓，扣除自身后校验）
     if (!editId) {
       const metrics = metricsFor(fund);
@@ -987,12 +991,13 @@ function handleTrade(form) {
     trade.shares = shares;
     trade.fee = fee;
     trade.note = note;
+    trade.pending = pending;
     if (!Number.isInteger(trade.tierIndex) && form.elements.source) trade.source = source;
 
     store.save(state);
     hideSheet();
     render();
-    toast('交易已更新', 'success');
+    toast(pending ? '净值未更新，记录已暂存' : '交易已更新', 'success');
     return;
   }
 
@@ -1008,6 +1013,7 @@ function handleTrade(form) {
     tierIndex,
     note,
     closed: false,
+    pending,
     createdAt: Date.now()
   };
 
@@ -1027,7 +1033,12 @@ function handleTrade(form) {
   store.save(state);
   hideSheet();
   render();
-  toast(type === 'SELL' ? '卖出已登记' : '买入已登记', 'success');
+  toast(
+    pending
+      ? '当日净值未更新，记录已暂存（净值更新后自动确认）'
+      : type === 'SELL' ? '卖出已登记' : '买入已登记',
+    'success'
+  );
 }
 
 function handleManualNav(form) {
@@ -1049,11 +1060,13 @@ function handleManualNav(form) {
   else history.push({ date: navDate, nav });
   history.sort((a, b) => a.date.localeCompare(b.date));
   fund.navHistory = history.slice(-365);
+  // 手动补录净值同样会确认对应日期的暂存交易
+  const settled = settleFundPending(fund);
 
   store.save(state);
   hideSheet();
   render();
-  toast('净值已更新', 'success');
+  toast(settled > 0 ? `净值已更新，已确认 ${settled} 笔暂存交易` : '净值已更新', 'success');
 }
 
 async function lookupFund(button) {
@@ -1678,22 +1691,14 @@ function updateTradeNavHint() {
   if (form.dataset.origDate && date === form.dataset.origDate && num(form.dataset.origNav) > 0) {
     navInfo = { nav: num(form.dataset.origNav), date, source: 'record' };
   }
-  if (!navInfo && Array.isArray(fund.navHistory)) {
-    const hit = fund.navHistory.find((h) => h.date === date);
-    if (hit) navInfo = { nav: hit.nav, date: hit.date, source: 'history' };
-    else {
-      const before = fund.navHistory
-        .filter((h) => h.date <= date)
-        .sort((a, b) => b.date.localeCompare(a.date))[0];
-      if (before) navInfo = { nav: before.nav, date: before.date, source: 'history' };
-    }
-  }
-  if (!navInfo && fund.nav > 0) navInfo = { nav: fund.nav, date: fund.navDate || date, source: 'latest' };
+  if (!navInfo) navInfo = resolveTradeNav(fund, date);
 
+  if (navInfo.pending) {
+    hint.innerHTML = '<b class="warn">⏳ 该日净值尚未公布：记录将暂存，净值更新后按当日净值自动确认</b>';
+    return;
+  }
   const sourceLabel = navInfo.source === 'record' ? '（原记录）' : navInfo.source === 'latest' ? '（最新）' : '';
-  hint.innerHTML = navInfo
-    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${sourceLabel}`
-    : '<b class="warn">⚠ 暂无净值数据，请先刷新或查询</b>';
+  hint.innerHTML = `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${sourceLabel}`;
 }
 
 function updateBaseDerivePreview() {
@@ -1784,6 +1789,16 @@ document.addEventListener('keydown', (event) => {
 });
 
 window.addEventListener('hashchange', render);
+
+// 启动时结算暂存交易（净值早已更新但未确认的记录补确认），再执行定投补记
+let settledAtBoot = 0;
+state.funds.forEach((fund) => {
+  settledAtBoot += settleFundPending(fund);
+});
+if (settledAtBoot > 0) {
+  store.save(state);
+  toast(`已按当日净值确认 ${settledAtBoot} 笔暂存交易`, 'success');
+}
 
 // 启动时执行定投补记（净值已出的交易日自动补投；缺净值待刷新后自动补）
 applySip();

@@ -115,6 +115,8 @@ function sanitizeTrade(trade) {
     tierIndex: Number.isInteger(trade.tierIndex) ? trade.tierIndex : null,
     note: typeof trade.note === 'string' ? trade.note : '',
     closed: Boolean(trade.closed),
+    // 净值未更新前的暂存交易：true 时不参与持仓/收益计算，净值到达后结算转正
+    pending: Boolean(trade.pending),
     createdAt: num(trade.createdAt) || Date.now()
   };
 }

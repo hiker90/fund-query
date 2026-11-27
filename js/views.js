@@ -9,7 +9,7 @@ import {
   todayISO,
   toneClass
 } from './ui.js';
-import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, STRATEGY_PRESETS, STRATEGY_KEYS, cloneStrategyPreset, computeMacroAdvice, sparklineData, summarizeAttention, SIP_WEEKDAYS } from './strategy.js';
+import { simulateAdd, computeAllocation, computeThreeAssetAllocation, ASSET_CLASSES, parseBatchText, recommendAssetScheme, resolveTradeNav, STRATEGY_PRESETS, STRATEGY_KEYS, cloneStrategyPreset, computeMacroAdvice, sparklineData, summarizeAttention, SIP_WEEKDAYS } from './strategy.js';
 
 const STATUS_META = {
   normal: { label: '运行中', tone: 'ok', rank: 5 },
@@ -415,18 +415,18 @@ export function tradesPage(state, metricsMap) {
   const filtered =
     tradesFilterType === 'ALL' ? allTrades : allTrades.filter((item) => item.trade.type === tradesFilterType);
 
-  // 统计
+  // 统计（暂存记录计入条数便于查看，但不参与投入/回收金额汇总）
   let buyAmount = 0;
   let sellAmount = 0;
   let buyCount = 0;
   let sellCount = 0;
   allTrades.forEach(({ trade }) => {
     if (trade.type === 'SELL') {
-      sellAmount += trade.amount;
       sellCount += 1;
+      if (!trade.pending) sellAmount += trade.amount;
     } else {
-      buyAmount += trade.amount;
       buyCount += 1;
+      if (!trade.pending) buyAmount += trade.amount;
     }
   });
 
@@ -463,19 +463,23 @@ export function tradesPage(state, metricsMap) {
         : trade.source === 'SIP'
           ? '定投买入'
           : '买入 · 底仓';
+    // 暂存记录：净值未定 → BUY 显示金额、份额待确认；SELL 显示份额、金额待确认
+    const navText = trade.pending ? '净值待确认' : `净值 ${fmtNav(trade.nav)}`;
+    const amountText = trade.pending && isSell ? '—' : `${isSell ? '-' : '+'}${fmtMoney(trade.amount)}`;
+    const sharesText = trade.pending && !isSell ? '待确认' : `${fmtShares(trade.shares)} 份`;
     return `${monthHeader}
       <li class="trade-item" role="button" tabindex="0" data-action="open-fund" data-id="${esc(fund.id)}">
         <div class="trade-left">
           <span class="trade-dot ${isSell ? 'sell' : 'buy'}"></span>
           <div>
-            <b>${esc(fund.name || fund.code)}</b>
-            <small>${esc(fund.code)} · ${esc(sourceLabel)} · 净值 ${fmtNav(trade.nav)}${trade.fee ? ` · 费 ${fmtMoney(trade.fee)}` : ''}</small>
+            <b>${esc(fund.name || fund.code)}</b>${trade.pending ? '<span class="badge badge-warn">待净值</span>' : ''}
+            <small>${esc(fund.code)} · ${esc(sourceLabel)} · ${navText}${trade.fee ? ` · 费 ${fmtMoney(trade.fee)}` : ''}</small>
             ${trade.note ? `<small class="trade-note">${esc(trade.note)}</small>` : ''}
           </div>
         </div>
         <div class="trade-right">
-          <b class="num ${isSell ? 'sell' : ''}">${isSell ? '-' : '+'}${fmtMoney(trade.amount)}</b>
-          <small class="num">${fmtDate(trade.date)} · ${fmtShares(trade.shares)} 份</small>
+          <b class="num ${isSell ? 'sell' : ''}">${amountText}</b>
+          <small class="num">${fmtDate(trade.date)} · ${sharesText}</small>
         </div>
       </li>`;
   });
@@ -862,20 +866,22 @@ function tradesCard(metrics) {
                   : trade.source === 'ADD'
                     ? `补仓${Number.isInteger(trade.tierIndex) ? ` · 第 ${trade.tierIndex + 1} 档` : ''}`
                     : '买入 · 底仓';
+                const amountText = trade.pending && isSell ? '—' : `${isSell ? '-' : '+'}${fmtMoney(trade.amount)}`;
+                const sharesText = trade.pending && !isSell ? '待确认' : `${fmtShares(trade.shares)} 份`;
                 return `
                 <li class="trade-item" role="button" tabindex="0" data-action="edit-trade"
                   data-fund="${esc(metrics.fund.id)}" data-trade="${esc(trade.id)}">
                   <div class="trade-left">
                     <span class="trade-dot ${isSell ? 'sell' : 'buy'}"></span>
                     <div>
-                      <b>${esc(sourceLabel)}</b>
-                      <small>${fmtDate(trade.date)} · 净值 ${fmtNav(trade.nav)}${trade.fee ? ` · 费 ${fmtMoney(trade.fee)}` : ''}</small>
+                      <b>${esc(sourceLabel)}</b>${trade.pending ? '<span class="badge badge-warn">待净值</span>' : ''}
+                      <small>${fmtDate(trade.date)} · ${trade.pending ? '净值待确认' : `净值 ${fmtNav(trade.nav)}`}${trade.fee ? ` · 费 ${fmtMoney(trade.fee)}` : ''}</small>
                       ${trade.note ? `<small class="trade-note">${esc(trade.note)}</small>` : ''}
                     </div>
                   </div>
                   <div class="trade-right">
-                    <b class="num ${isSell ? 'sell' : ''}">${isSell ? '-' : '+'}${fmtMoney(trade.amount)}</b>
-                    <small class="num">${fmtShares(trade.shares)} 份</small>
+                    <b class="num ${isSell ? 'sell' : ''}">${amountText}</b>
+                    <small class="num">${sharesText}</small>
                   </div>
                   <button class="link-btn" type="button" data-action="delete-trade"
                     data-fund="${esc(metrics.fund.id)}" data-trade="${esc(trade.id)}">删除</button>
@@ -1822,24 +1828,6 @@ export function addFundSheetBody(categories = []) {
     </form>`;
 }
 
-/** 在 fund 的 navHistory 里查找指定日期净值，找不到用最新净值兜底 */
-function resolveNavForDate(fund, dateStr) {
-  if (!fund) return null;
-  if (Array.isArray(fund.navHistory)) {
-    const hit = fund.navHistory.find((h) => h.date === dateStr);
-    if (hit) return { nav: hit.nav, date: hit.date, source: 'history' };
-    // 找该日期之前最近的一条（工作日净值）
-    const before = fund.navHistory
-      .filter((h) => h.date <= dateStr)
-      .sort((a, b) => b.date.localeCompare(a.date))[0];
-    if (before) return { nav: before.nav, date: before.date, source: 'history' };
-  }
-  if (fund.nav > 0) {
-    return { nav: fund.nav, date: fund.navDate || dateStr, source: 'latest' };
-  }
-  return null;
-}
-
 export function tradeSheetBody(fund, metrics, preset = {}) {
   const isSell = preset.type === 'SELL';
   const isBase = (preset.source || 'BASE') === 'BASE';
@@ -1847,15 +1835,16 @@ export function tradeSheetBody(fund, metrics, preset = {}) {
   const editId = preset.editTradeId || '';
   const today = todayISO();
   const defaultDate = preset.date || today;
-  // 编辑模式：日期未改时沿用原记录净值，避免反推成本被最新净值覆盖
+  // 编辑模式：日期未改时沿用原记录净值，避免反推成本被最新净值覆盖；
+  // 当日净值未公布（resolveTradeNav → pending）时提示暂存
   const navInfo =
     editId && preset.nav > 0
-      ? { nav: preset.nav, date: defaultDate, source: 'record' }
-      : resolveNavForDate(fund, defaultDate);
+      ? { nav: preset.nav, date: defaultDate, source: 'record', pending: false }
+      : resolveTradeNav(fund, defaultDate);
   const navLabel = navInfo.source === 'record' ? '（原记录）' : navInfo.source === 'latest' ? '（最新）' : '';
-  const navHint = navInfo
-    ? `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${navLabel}`
-    : '<b class="warn">⚠ 暂无净值数据，请先刷新或查询</b>';
+  const navHint = navInfo.pending
+    ? '<b class="warn">⏳ 该日净值尚未公布：记录将暂存，待净值更新后按当日净值自动确认（暂存记录不参与持仓与收益计算）</b>'
+    : `将使用 ${navInfo.date} 净值 <b>${navInfo.nav.toFixed(4)}</b>${navLabel}`;
 
   // 空基金（无份额且无交易记录）→ 只显示底仓登记（市值 + 收益率）
   const hasPosition = !!(metrics && metrics.position && metrics.position.shares > 0);

@@ -18,6 +18,8 @@ import {
   sipSyntheticTrade,
   recommendAssetScheme,
   resolveStrategyByKey,
+  resolveTradeNav,
+  settlePendingTrades,
   simulateAdd,
   sparklineData,
   summarizeAttention,
@@ -1118,6 +1120,113 @@ test('迁移：幂等（对迁移结果重复 normalize 完全一致）', () => 
   assert.equal(once.settings.defaultStrategy, 'AGGRESSIVE');
   assert.equal(once.funds[0].strategyOverride, 'NORMAL'); // stopLossPct 11 > 10 → NORMAL
   assert.equal(once.funds[1].strategyOverride, 'NONE');
+});
+
+/* ============================ 交易暂存（pending） ============================ */
+
+test('resolveTradeNav：当日净值已在历史中 → 确认且 nav 为当日净值', () => {
+  const fund = { navHistory: [{ date: '2026-11-25', nav: 1.2345 }], nav: 9.9, navDate: '2026-11-26' };
+  const r = resolveTradeNav(fund, '2026-11-25');
+  assert.equal(r.pending, false);
+  close(r.nav, 1.2345, 1e-9, '当日净值');
+});
+
+test('resolveTradeNav：当日净值未公布（date > 最新净值日）→ pending 暂存', () => {
+  const fund = { navHistory: [{ date: '2026-11-25', nav: 1.2345 }], nav: 1.2345, navDate: '2026-11-25' };
+  const r = resolveTradeNav(fund, '2026-11-26');
+  assert.equal(r.pending, true);
+  assert.equal(r.nav, 0);
+});
+
+test('resolveTradeNav：回填早于历史最早日的老交易 → 用最新净值兜底确认（老口径）', () => {
+  const fund = { navHistory: [{ date: '2026-11-01', nav: 2 }], nav: 3, navDate: '2026-11-26' };
+  const r = resolveTradeNav(fund, '2026-10-15');
+  assert.equal(r.pending, false);
+  close(r.nav, 3, 1e-9, '兜底最新净值');
+});
+
+test('resolveTradeNav：基金无任何净值 → pending（不再报错阻断记账）', () => {
+  const r = resolveTradeNav({ navHistory: [], nav: 0, navDate: '' }, '2026-11-26');
+  assert.equal(r.pending, true);
+});
+
+test('settlePendingTrades：BUY 暂存记录以当日净值结算份额', () => {
+  const fund = {
+    navHistory: [{ date: '2026-11-25', nav: 1.2 }],
+    nav: 1.2,
+    navDate: '2026-11-25',
+    trades: [
+      buy('2026-11-24', 1, 1000),
+      { ...buy('2026-11-25', 0, 1200), shares: 0, pending: true }
+    ]
+  };
+  const { trades, settledCount } = settlePendingTrades(fund);
+  assert.equal(settledCount, 1);
+  assert.equal(trades[1].pending, false);
+  close(trades[1].nav, 1.2, 1e-9, '结算净值');
+  close(trades[1].shares, 1200 / 1.2, 1e-9, '结算份额 = 金额 ÷ 当日净值');
+  // 持仓计算：结算前 pending 不参与；结算后参与
+  close(computePosition(fund.trades).cost, 1000, 1e-9, '暂存买入不参与持仓成本');
+  close(computePosition(trades).cost, 2200, 1e-9, '结算后计入持仓成本');
+});
+
+test('settlePendingTrades：SELL 暂存记录以当日净值结算金额', () => {
+  const fund = {
+    navHistory: [{ date: '2026-11-25', nav: 2 }],
+    nav: 2,
+    navDate: '2026-11-25',
+    trades: [
+      buy('2026-11-20', 1, 2000),
+      { ...buy('2026-11-25', 0, 0), type: 'SELL', shares: 300, amount: 0, pending: true }
+    ]
+  };
+  const { trades, settledCount } = settlePendingTrades(fund);
+  assert.equal(settledCount, 1);
+  assert.equal(trades[1].pending, false);
+  close(trades[1].amount, 600, 1e-9, '结算金额 = 份额 × 当日净值');
+  close(computePosition(trades).shares, 1700, 1e-9, '结算后卖出才减少份额');
+});
+
+test('settlePendingTrades：周末/节假日暂存交易 → 用下一交易日净值确认', () => {
+  const fund = {
+    navHistory: [
+      { date: '2026-11-27', nav: 1 },
+      { date: '2026-11-30', nav: 1.5 }
+    ],
+    nav: 1.5,
+    navDate: '2026-11-30',
+    trades: [{ ...buy('2026-11-28', 0, 1000), shares: 0, pending: true }]
+  };
+  const { trades, settledCount } = settlePendingTrades(fund);
+  assert.equal(settledCount, 1);
+  close(trades[0].nav, 1.5, 1e-9, '下一交易日净值');
+  close(trades[0].shares, 1000 / 1.5, 1e-9, '份额');
+});
+
+test('settlePendingTrades：净值尚未到达的暂存记录保持 pending，纯函数不改入参', () => {
+  const pendingTrade = { ...buy('2026-11-26', 0, 500), shares: 0, pending: true };
+  const fund = {
+    navHistory: [{ date: '2026-11-25', nav: 1 }],
+    nav: 1,
+    navDate: '2026-11-25',
+    trades: [pendingTrade]
+  };
+  const { trades, settledCount } = settlePendingTrades(fund);
+  assert.equal(settledCount, 0);
+  assert.equal(trades[0].pending, true);
+  assert.equal(fund.trades[0], pendingTrade); // 未结算时不改动原数组元素
+});
+
+test('computeFundMetrics：暂存买入不参与当日买入市值与持仓', () => {
+  const fund = fundWith([
+    buy('2026-11-20', 1, 10000),
+    { ...buy('2026-11-25', 0, 1200), shares: 0, pending: true }
+  ]);
+  fund.nav = 1.1;
+  fund.navDate = '2026-11-25';
+  const metrics = computeFundMetrics(fund, DEFAULT_STRATEGY);
+  close(metrics.position.cost, 10000, 1e-9, '持仓成本不含暂存');
+  close(metrics.marketValue, 11000, 1e-6, '市值不含暂存买入');
 });
 
 console.log(`\n${passed} 通过，${failed} 失败`);
